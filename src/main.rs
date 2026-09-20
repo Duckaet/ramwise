@@ -232,18 +232,9 @@ async fn run_app(
         // Effect pump: a confirmed external tool suspends the TUI, runs
         // with the real terminal, then resumes. Failures report through
         // the standard status mechanism once we are back.
-        if let Some((tool, spec)) = app.pending_spawn.take() {
-            disable_raw_mode().context("Failed to suspend terminal mode")?;
-            execute!(terminal.backend_mut(), LeaveAlternateScreen)
-                .context("Failed to leave alternate screen")?;
-            let result = external_tools::run_interactive(&spec);
-            execute!(terminal.backend_mut(), EnterAlternateScreen)
-                .context("Failed to re-enter alternate screen")?;
-            enable_raw_mode().context("Failed to resume terminal mode")?;
-            terminal
-                .clear()
-                .context("Failed to redraw after tool exit")?;
-            app.complete_spawn(tool, result);
+        if let Some((tool, pid, spec)) = app.pending_spawn.take() {
+            let outcome = run_suspended(&mut *terminal, &spec, pid);
+            app.complete_spawn(tool, outcome);
         }
     }
 
@@ -336,6 +327,88 @@ fn render_kill_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(paragraph, modal_area);
 }
 
+/// Run one validated tool with the real terminal.
+///
+/// Revalidates at spawn time: the binary must still be executable and the
+/// target must still exist, closing the confirm-to-spawn window (PATH
+/// swaps, exited or recycled PIDs) with explicit status errors instead of
+/// acting on stale validation.
+fn run_suspended(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    spec: &external_tools::CommandSpec,
+    pid: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    if !external_tools::program_executable(&spec.program) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is no longer executable", spec.program.display()),
+        ));
+    }
+    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return Err(std::io::Error::from_raw_os_error(3)); // ESRCH: exited
+    }
+    let mut guard = TerminalGuard::suspend(terminal).map_err(std::io::Error::other)?;
+    let result = external_tools::run_interactive(spec);
+    guard.resume().map_err(std::io::Error::other)?;
+    result
+}
+
+/// Suspends the TUI while alive and resumes on drop, so a spawn failure,
+/// an early return or a panic can never leave the terminal cooked on the
+/// main screen. Explicit [`TerminalGuard::resume`] clears the flag; the
+/// `Drop` fallback restores best-effort and never panics.
+struct TerminalGuard<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+    resumed: bool,
+}
+
+impl<'a> TerminalGuard<'a> {
+    fn suspend(terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<Self, String> {
+        use crossterm::event::DisableMouseCapture;
+        disable_raw_mode().map_err(|error| format!("suspend terminal: {error}"))?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )
+        .map_err(|error| format!("suspend terminal: {error}"))?;
+        Ok(Self {
+            terminal,
+            resumed: false,
+        })
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        use crossterm::event::EnableMouseCapture;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )
+        .map_err(|error| format!("resume terminal: {error}"))?;
+        enable_raw_mode().map_err(|error| format!("resume terminal: {error}"))?;
+        self.terminal
+            .clear()
+            .map_err(|error| format!("resume terminal: {error}"))?;
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard<'_> {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture
+            );
+            let _ = enable_raw_mode();
+        }
+    }
+}
+
 fn render_tool_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let width = 70.min(area.width.saturating_sub(4));
@@ -347,7 +420,7 @@ fn render_tool_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(Clear, modal_area);
 
     let label = match &app.pending_tool {
-        Some((tool, spec)) => format!("{} {}?", tool.label(), external_tools::describe(spec)),
+        Some((tool, _, spec)) => format!("{} {}?", tool.label(), external_tools::describe(spec)),
         None => "No tool selected".to_string(),
     };
 

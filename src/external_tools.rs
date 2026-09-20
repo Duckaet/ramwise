@@ -73,10 +73,12 @@ impl std::fmt::Display for ToolError {
 
 /// Find an executable on PATH without spawning a shell or `which`.
 /// `path_var` is injected for tests; callers pass `std::env::var_os("PATH")`.
+/// Only absolute directories participate: a relative PATH entry resolves
+/// against whatever the working directory happens to be at spawn time.
 pub fn resolve_on_path(name: &str, path_var: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let path_var = path_var?;
     for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
+        if !dir.is_absolute() {
             continue;
         }
         let candidate = dir.join(name);
@@ -85,6 +87,12 @@ pub fn resolve_on_path(name: &str, path_var: Option<std::ffi::OsString>) -> Opti
         }
     }
     None
+}
+
+/// Whether a resolved program is still executable (spawn-time recheck
+/// against PATH swaps between confirmation and launch).
+pub fn program_executable(program: &Path) -> bool {
+    is_executable(program)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -126,20 +134,41 @@ pub fn build_command(
         ExternalTool::Htop => vec!["-p".to_string(), process.pid.to_string()],
         ExternalTool::Strace => vec!["-p".to_string(), process.pid.to_string()],
         ExternalTool::Valgrind => {
-            let exe = process
-                .cmdline
-                .split_whitespace()
-                .next()
-                .filter(|arg| !arg.is_empty())
-                .unwrap_or(&process.name);
+            // Valgrind cannot attach: relaunch the executable behind the
+            // same confirmation. Resolve through /proc/<pid>/exe so a
+            // relative argv[0] cannot hijack the child PATH; fall back to
+            // an absolute argv[0], and refuse anything else.
             vec![
                 "--tool=memcheck".to_string(),
                 "--".to_string(),
-                exe.to_string(),
+                resolve_target_exe(process)?,
             ]
         }
     };
     Ok(CommandSpec { program, args })
+}
+
+/// Absolute executable path for a target: the kernel's view first.
+fn resolve_target_exe(process: &ProcessMemory) -> Result<String, ToolError> {
+    let proc_exe = PathBuf::from(format!("/proc/{}/exe", process.pid));
+    if let Ok(target) = std::fs::read_link(&proc_exe) {
+        // Deleted binaries report " (deleted)"; still absolute, still fine.
+        if target.is_absolute() {
+            return Ok(target.to_string_lossy().into_owned());
+        }
+    }
+    let first = process
+        .cmdline
+        .split_whitespace()
+        .next()
+        .filter(|arg| !arg.is_empty())
+        .unwrap_or(&process.name);
+    if first.starts_with('/') {
+        return Ok(first.to_string());
+    }
+    Err(ToolError::UnsupportedTarget(
+        "cannot determine an absolute executable path for valgrind relaunch".to_string(),
+    ))
 }
 
 /// Spawn a validated command interactively, waiting for exit. The caller
@@ -160,9 +189,10 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn fixture_path_with_tools(tools: &[&str]) -> std::ffi::OsString {
+    fn fixture_path_with_tools(tools: &[&str]) -> (PathBuf, std::ffi::OsString) {
         let dir = std::env::temp_dir().join(format!(
-            "ramwise-tools-{}",
+            "ramwise-tools-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos())
@@ -176,7 +206,12 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).unwrap();
         }
-        dir.into_os_string()
+        let path_var: std::ffi::OsString = dir.clone().into_os_string();
+        (dir, path_var)
+    }
+
+    fn cleanup(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn target_process() -> ProcessMemory {
@@ -192,15 +227,16 @@ mod tests {
 
     #[test]
     fn resolve_finds_executables_and_skips_missing() {
-        let path = fixture_path_with_tools(&["htop"]);
+        let (dir, path) = fixture_path_with_tools(&["htop"]);
         assert!(resolve_on_path("htop", Some(path.clone())).is_some());
         assert_eq!(resolve_on_path("strace", Some(path)), None);
         assert_eq!(resolve_on_path("htop", None), None);
+        cleanup(&dir);
     }
 
     #[test]
     fn pid_travels_as_a_discrete_argument_never_a_shell_string() {
-        let path = fixture_path_with_tools(&["htop", "strace"]);
+        let (dir, path) = fixture_path_with_tools(&["htop", "strace"]);
         let process = target_process();
         let htop = build_command(ExternalTool::Htop, &process, Some(path.clone())).unwrap();
         assert_eq!(htop.args, vec!["-p".to_string(), "4242".to_string()]);
@@ -210,11 +246,12 @@ mod tests {
         assert!(htop.program.ends_with("htop"));
         let strace = build_command(ExternalTool::Strace, &process, Some(path)).unwrap();
         assert_eq!(strace.args, vec!["-p".to_string(), "4242".to_string()]);
+        cleanup(&dir);
     }
 
     #[test]
     fn valgrind_relaunches_the_executable_without_original_args() {
-        let path = fixture_path_with_tools(&["valgrind"]);
+        let (dir, path) = fixture_path_with_tools(&["valgrind"]);
         let spec = build_command(ExternalTool::Valgrind, &target_process(), Some(path)).unwrap();
         assert_eq!(
             spec.args,
@@ -224,17 +261,33 @@ mod tests {
                 "/usr/bin/worker".to_string()
             ]
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn valgrind_refuses_relative_executables() {
+        let (dir, path) = fixture_path_with_tools(&["valgrind"]);
+        let mut process = target_process();
+        process.pid = 987_654_321;
+        process.cmdline = "relative-worker --flag".into();
+        process.name = "relative-worker".into();
+        assert!(matches!(
+            build_command(ExternalTool::Valgrind, &process, Some(path)),
+            Err(ToolError::UnsupportedTarget(_))
+        ));
+        cleanup(&dir);
     }
 
     #[test]
     fn missing_binaries_and_bad_targets_are_explicit() {
-        let path = fixture_path_with_tools(&[]);
+        let (dir, path) = fixture_path_with_tools(&[]);
         let process = target_process();
         assert_eq!(
             build_command(ExternalTool::Htop, &process, Some(path)),
             Err(ToolError::MissingBinary("htop"))
         );
-        let path = fixture_path_with_tools(&["htop"]);
+        cleanup(&dir);
+        let (dir, path) = fixture_path_with_tools(&["htop"]);
         let mut kernel = target_process();
         kernel.rss = 0;
         kernel.vss = 0;
@@ -248,6 +301,7 @@ mod tests {
             build_command(ExternalTool::Htop, &low, Some(path)),
             Err(ToolError::UnsupportedTarget(_))
         ));
+        cleanup(&dir);
     }
 
     #[test]

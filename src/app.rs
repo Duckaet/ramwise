@@ -81,10 +81,10 @@ pub struct App {
     /// Whether SIGKILL confirmation dialog is visible
     pub show_kill_confirm: bool,
     /// External-tool launch awaiting explicit confirmation
-    pub pending_tool: Option<(ExternalTool, CommandSpec)>,
+    pub pending_tool: Option<(ExternalTool, i32, CommandSpec)>,
     /// Validated command the TUI owner should spawn (effect: suspend the
     /// TUI, run it, resume, then call [`App::complete_spawn`]).
-    pub pending_spawn: Option<(ExternalTool, CommandSpec)>,
+    pub pending_spawn: Option<(ExternalTool, i32, CommandSpec)>,
     /// Transient status for process action feedback
     pub action_status: Option<ActionStatus>,
     /// Sorted processes (cached)
@@ -355,7 +355,7 @@ impl App {
             return;
         };
         match build_command(tool, process, std::env::var_os("PATH")) {
-            Ok(spec) => self.pending_tool = Some((tool, spec)),
+            Ok(spec) => self.pending_tool = Some((tool, process.pid, spec)),
             Err(ToolError::MissingBinary(name)) => self.set_status(
                 ActionStatusKind::Warning,
                 format!("{name} is not installed; install it to use this action"),
@@ -369,8 +369,8 @@ impl App {
     fn handle_tool_confirm_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Enter => {
-                if let Some((tool, spec)) = self.pending_tool.take() {
-                    self.pending_spawn = Some((tool, spec));
+                if let Some((tool, pid, spec)) = self.pending_tool.take() {
+                    self.pending_spawn = Some((tool, pid, spec));
                 }
             }
             KeyCode::Esc => {
@@ -548,6 +548,7 @@ mod tests {
         let mut app = App {
             pending_tool: Some((
                 ExternalTool::Htop,
+                7,
                 CommandSpec {
                     program: "/usr/bin/htop".into(),
                     args: vec!["-p".into(), "7".into()],
@@ -557,12 +558,14 @@ mod tests {
         };
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.pending_tool.is_none());
-        let (tool, spec) = app.pending_spawn.take().unwrap();
+        let (tool, pid, spec) = app.pending_spawn.take().unwrap();
         assert_eq!(tool, ExternalTool::Htop);
+        assert_eq!(pid, 7);
         assert_eq!(spec.args, vec!["-p".to_string(), "7".to_string()]);
 
         app.pending_tool = Some((
             ExternalTool::Strace,
+            8,
             CommandSpec {
                 program: "/usr/bin/strace".into(),
                 args: vec![],
