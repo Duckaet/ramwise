@@ -559,6 +559,7 @@ fn sort_processes(processes: &mut [ProcessMemory], mode: SortMode) {
                 (
                     crate::categories::classify(a).rank(),
                     std::cmp::Reverse(a.rss),
+                    a.pid,
                 )
             });
         }
