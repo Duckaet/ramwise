@@ -53,8 +53,10 @@ impl<'a> Widget for GraphWidget<'a> {
         const SPARK_MAX: usize = 24;
 
         // Bound chart resolution by render width so huge histories and
-        // narrow terminals stay cheap: at most one bucket per ~cell.
+        // narrow terminals stay cheap: at most one bucket per ~cell. The
+        // title sparkline shares the same bound.
         let width_points = area.width.saturating_sub(8).max(2) as usize;
+        let spark_max = SPARK_MAX.min(width_points);
 
         // Determine what to graph
         let (title, trend, spark, is_process) = if let Some(pid) = self.selected_pid {
@@ -62,7 +64,7 @@ impl<'a> Widget for GraphWidget<'a> {
                 "Process Memory",
                 self.history
                     .process_trend_downsampled(pid, CHART_WINDOW, width_points),
-                self.history.process_sparkline(pid, SPARK_WINDOW, SPARK_MAX),
+                self.history.process_sparkline(pid, SPARK_WINDOW, spark_max),
                 true,
             )
         } else {
@@ -70,7 +72,7 @@ impl<'a> Widget for GraphWidget<'a> {
                 "System Memory",
                 self.history
                     .system_trend_downsampled(CHART_WINDOW, width_points),
-                self.history.system_sparkline(SPARK_WINDOW, SPARK_MAX),
+                self.history.system_sparkline(SPARK_WINDOW, spark_max),
                 false,
             )
         };
@@ -115,7 +117,6 @@ impl<'a> Widget for GraphWidget<'a> {
         };
 
         let x_max = data.len().saturating_sub(1) as f64;
-        let time_span = data.len();
 
         let datasets = vec![
             Dataset::default()
@@ -126,10 +127,11 @@ impl<'a> Widget for GraphWidget<'a> {
                 .data(&data),
         ];
 
-        // Modern time labels
+        // Modern time labels: the window behind the view, not the bucket
+        // count (downsampling would otherwise mislabel the axis).
         let x_labels = vec![
             Span::styled(
-                format!("-{}s", time_span),
+                format!("-{}s", CHART_WINDOW.as_secs()),
                 Style::default().fg(self.theme.fg_muted),
             ),
             Span::styled("now", Style::default().fg(self.theme.fg_dim)),

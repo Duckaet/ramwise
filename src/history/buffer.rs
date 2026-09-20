@@ -235,7 +235,9 @@ impl HistoryBuffer {
 
     /// Normalized sparkline of total RSS for one category: points sharing a
     /// snapshot tick are summed first, so each tick contributes its category
-    /// total before windowing and bucketing.
+    /// total before windowing and bucketing. Windowed against the buffer's
+    /// global latest tick: a category with no recent points reports unknown
+    /// (empty) instead of a stale-looking series.
     pub fn category_sparkline(
         &self,
         category: Category,
@@ -243,17 +245,37 @@ impl HistoryBuffer {
         max_points: usize,
     ) -> Vec<f64> {
         use std::collections::BTreeMap;
+        let Some(latest) = self.latest_timestamp() else {
+            return Vec::new();
+        };
+        let cutoff = latest.checked_sub(window).unwrap_or_else(|| {
+            self.system_history
+                .front()
+                .map(|(timestamp, _)| *timestamp)
+                .unwrap_or(latest)
+        });
         let mut per_tick: BTreeMap<Instant, u64> = BTreeMap::new();
         for history in self.process_history.values() {
             for point in history {
-                if point.category == category {
-                    *per_tick.entry(point.timestamp).or_insert(0) += point.rss;
+                if point.category == category && point.timestamp >= cutoff {
+                    let entry = per_tick.entry(point.timestamp).or_insert(0);
+                    *entry = entry.saturating_add(point.rss);
                 }
             }
         }
-        // u64 sums cannot overflow in practice; saturating anyway.
         let series: Vec<(Instant, u64)> = per_tick.into_iter().collect();
         normalize(&downsample(&series, window, max_points))
+    }
+
+    /// Newest timestamp across system and process histories, if any.
+    fn latest_timestamp(&self) -> Option<Instant> {
+        let system_latest = self.system_history.back().map(|(timestamp, _)| *timestamp);
+        let process_latest = self
+            .process_history
+            .values()
+            .filter_map(|history| history.back().map(|point| point.timestamp))
+            .max();
+        system_latest.into_iter().chain(process_latest).max()
     }
 
     /// Calculate growth rate for a process over a duration
@@ -375,7 +397,14 @@ fn downsample(
         .last()
         .map(|(timestamp, _)| *timestamp)
         .unwrap_or_else(Instant::now);
-    let cutoff = latest.checked_sub(window).unwrap_or(latest);
+    let cutoff = latest.checked_sub(window).unwrap_or_else(|| {
+        // A window longer than uptime underflows the subtraction: keep
+        // every point rather than collapsing to just the latest one.
+        values
+            .first()
+            .map(|(timestamp, _)| *timestamp)
+            .unwrap_or(latest)
+    });
     let in_window: Vec<(Instant, u64)> = values
         .iter()
         .copied()
@@ -389,12 +418,14 @@ fn downsample(
     in_window
         .chunks(chunk)
         .map(|chunk| {
-            let sum: u64 = chunk.iter().map(|(_, value)| *value).sum();
+            // u128 accumulation: bucket sums of byte counts cannot wrap.
+            let sum: u128 = chunk.iter().map(|(_, value)| *value as u128).sum();
             let timestamp = chunk
                 .last()
                 .map(|(timestamp, _)| *timestamp)
                 .unwrap_or(latest);
-            (timestamp, sum / chunk.len().max(1) as u64)
+            let average = (sum / chunk.len().max(1) as u128).min(u64::MAX as u128) as u64;
+            (timestamp, average)
         })
         .collect()
 }
@@ -542,6 +573,50 @@ mod tests {
         assert_eq!(
             buffer.process_sparkline(test_support::FIXTURE_PID, Duration::from_secs(600), 8),
             vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn stale_categories_report_unknown() {
+        let base = Instant::now();
+        let mut buffer = HistoryBuffer::new(10, Duration::from_secs(600));
+        buffer.push(&MemorySnapshot {
+            timestamp: base,
+            system: SystemMemory::default(),
+            processes: vec![ProcessMemory {
+                pid: 11,
+                name: "firefox".into(),
+                cmdline: "firefox".into(),
+                rss: 100,
+                vss: 100,
+                ..Default::default()
+            }],
+            total_processes: 1,
+            running_processes: 1,
+        });
+        buffer.push(&MemorySnapshot {
+            timestamp: base + Duration::from_secs(500),
+            system: SystemMemory::default(),
+            processes: vec![ProcessMemory {
+                pid: 13,
+                name: "sshd".into(),
+                cmdline: "sshd".into(),
+                rss: 100,
+                vss: 100,
+                ..Default::default()
+            }],
+            total_processes: 1,
+            running_processes: 1,
+        });
+        // The browser tick is within retention but outside the 60s window
+        // anchored at the latest tick: unknown, not a stale series.
+        assert_eq!(
+            buffer.category_sparkline(Category::Browser, Duration::from_secs(60), 8),
+            Vec::<f64>::new()
+        );
+        assert_eq!(
+            buffer.category_sparkline(Category::Service, Duration::from_secs(600), 8),
+            vec![0.5]
         );
     }
 
