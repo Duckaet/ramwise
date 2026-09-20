@@ -3,13 +3,14 @@
 //! [`ProcessFilter`] is a composable, typed predicate over one process:
 //! every enabled condition must hold (AND). [`order_as_tree`] stably
 //! reorders a slice into parent-before-child preorder so index-based
-//! selection keeps working in tree mode, and [`depth_of`] supplies the
+//! selection keeps working in tree mode, and [`forest_depths`] supplies the
 //! indentation for rendering. Missing or reparented processes become roots;
 //! ppid cycles are broken deterministically instead of recursing forever.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::collector::ProcessMemory;
+use crate::utils::format_bytes;
 
 /// Typed memory filters. All conditions combine with AND.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -29,15 +30,22 @@ impl ProcessFilter {
     }
 
     /// Short label for titles and tests; `None` when inactive.
-    pub fn label(self) -> Option<&'static str> {
+    /// Combined filters compose (`private-only + min-pss≥10M`) so the
+    /// title never hides an active predicate.
+    pub fn label(self) -> Option<String> {
+        let mut parts = Vec::new();
         if self.only_private {
-            Some("private-only")
+            parts.push("private-only".to_string());
         } else if self.only_shared {
-            Some("shared-only")
-        } else if self.min_pss_bytes > 0 {
-            Some("min-pss")
-        } else {
+            parts.push("shared-only".to_string());
+        }
+        if self.min_pss_bytes > 0 {
+            parts.push(format!("min-pss≥{}", format_bytes(self.min_pss_bytes)));
+        }
+        if parts.is_empty() {
             None
+        } else {
+            Some(parts.join(" + "))
         }
     }
 
@@ -68,6 +76,12 @@ pub fn order_as_tree(processes: &mut [ProcessMemory]) {
     }
     let pids: HashSet<i32> = processes.iter().map(|p| p.pid).collect();
     let is_root = |p: &ProcessMemory| p.ppid == 0 || p.ppid == p.pid || !pids.contains(&p.ppid);
+    // Parent PID to child indices in slice order, so each subtree visit is
+    // O(children) instead of rescanning the whole slice per node.
+    let mut children: HashMap<i32, Vec<usize>> = HashMap::new();
+    for (index, process) in processes.iter().enumerate() {
+        children.entry(process.ppid).or_default().push(index);
+    }
 
     let mut visited = vec![false; len];
     let mut order = Vec::with_capacity(len);
@@ -87,17 +101,20 @@ pub fn order_as_tree(processes: &mut [ProcessMemory]) {
                 }
                 visited[index] = true;
                 order.push(index);
-                let parent_pid = processes[index].pid;
                 // Push children in reverse so pop order keeps slice order.
-                for (child, process) in processes.iter().enumerate().rev() {
-                    if child != index && !visited[child] && process.ppid == parent_pid {
-                        stack.push(child);
+                if let Some(young) = children.get(&processes[index].pid) {
+                    for child in young.iter().rev() {
+                        if !visited[*child] {
+                            stack.push(*child);
+                        }
                     }
                 }
             }
         }
     }
 
+    // Reorder by permutation. Cloning here is one O(n) pass of plain
+    // moves — cheap next to a frame render — and keeps the code safe.
     let mut reordered = Vec::with_capacity(len);
     for index in order {
         reordered.push(processes[index].clone());
@@ -105,21 +122,37 @@ pub fn order_as_tree(processes: &mut [ProcessMemory]) {
     processes.clone_from_slice(&reordered);
 }
 
-/// Depth of one process in the ppid forest (roots are depth 0). Guards
-/// against cycles and missing parents by capping the walk.
-pub fn depth_of(processes: &[ProcessMemory], pid: i32) -> usize {
-    let pids: HashMap<i32, i32> = processes.iter().map(|p| (p.pid, p.ppid)).collect();
-    let mut depth = 0;
-    let mut current = pid;
-    let mut seen = HashSet::new();
-    while let Some(ppid) = pids.get(&current) {
-        if *ppid == 0 || *ppid == current || !pids.contains_key(ppid) || !seen.insert(current) {
-            break;
+/// Depth of every process in the ppid forest (roots are depth 0), computed
+/// over one shared parent map. Missing parents, self-parents and cycles
+/// all resolve to a finite depth instead of recursing.
+pub fn forest_depths(processes: &[ProcessMemory]) -> HashMap<i32, usize> {
+    let parent: HashMap<i32, i32> = processes.iter().map(|p| (p.pid, p.ppid)).collect();
+    let mut depths = HashMap::with_capacity(processes.len());
+    for process in processes {
+        let mut depth = 0;
+        let mut current = process.pid;
+        let mut seen = HashSet::new();
+        while let Some(ppid) = parent.get(&current) {
+            if *ppid == current || !seen.insert(current) {
+                break;
+            }
+            if *ppid == 0 {
+                // PID 0 parents one level when tracked; otherwise this
+                // process is a root and the walk ends here.
+                if parent.contains_key(&0) {
+                    depth += 1;
+                }
+                break;
+            }
+            if !parent.contains_key(ppid) {
+                break;
+            }
+            depth += 1;
+            current = *ppid;
         }
-        depth += 1;
-        current = *ppid;
+        depths.insert(process.pid, depth);
     }
-    depth
+    depths
 }
 
 #[cfg(test)]
@@ -175,8 +208,8 @@ mod tests {
             ..Default::default()
         };
         assert!(!both.matches(&process));
-        assert_eq!(private.label(), Some("private-only"));
-        assert_eq!(shared.label(), Some("shared-only"));
+        assert_eq!(private.label().as_deref(), Some("private-only"));
+        assert_eq!(shared.label().as_deref(), Some("shared-only"));
     }
 
     #[test]
@@ -203,8 +236,9 @@ mod tests {
         order_as_tree(&mut processes);
         let pids: Vec<i32> = processes.iter().map(|p| p.pid).collect();
         assert_eq!(pids, vec![1, 3, 2, 4]);
-        assert_eq!(depth_of(&processes, 4), 2);
-        assert_eq!(depth_of(&processes, 1), 0);
+        let depths = forest_depths(&processes);
+        assert_eq!(depths[&4], 2);
+        assert_eq!(depths[&1], 0);
     }
 
     #[test]
@@ -214,8 +248,8 @@ mod tests {
         let pids: Vec<i32> = processes.iter().map(|p| p.pid).collect();
         assert_eq!(pids.len(), 3);
         assert!(pids.contains(&9) && pids.contains(&8) && pids.contains(&7));
-        assert_eq!(depth_of(&processes, 9), 0);
-        assert_eq!(depth_of(&processes, 8), 0);
+        assert_eq!(forest_depths(&processes)[&9], 0);
+        assert_eq!(forest_depths(&processes)[&8], 0);
     }
 
     #[test]
@@ -227,5 +261,31 @@ mod tests {
         let mut sorted = pids.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![1, 2, 3]);
+    }
+    #[test]
+    fn deep_chains_terminate_with_all_processes() {
+        // Iterative traversal: depth is bounded only by the chain, never
+        // by the call stack. 2000 links prove termination cheaply.
+        let mut processes: Vec<ProcessMemory> =
+            (0..2_000).map(|i| proc(i, i - 1, 10)).collect();
+        processes[0].ppid = 0;
+        order_as_tree(&mut processes);
+        assert_eq!(processes.len(), 2_000);
+        assert_eq!(processes[0].pid, 0);
+        assert_eq!(forest_depths(&processes)[&1_999], 1_999);
+    }
+
+    #[test]
+    fn labels_compose_across_predicates() {
+        let filter = ProcessFilter {
+            only_private: true,
+            min_pss_bytes: 10 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            filter.label().as_deref(),
+            Some("private-only + min-pss≥10.0M")
+        );
+        assert_eq!(ProcessFilter::default().label(), None);
     }
 }

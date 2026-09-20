@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::collector::ProcessMemory;
-use crate::process_view::{ProcessFilter, depth_of};
+use crate::process_view::{ProcessFilter, forest_depths};
 use crate::ui::Theme;
 use crate::utils::format_bytes;
 
@@ -155,6 +155,14 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
         let mem_width = 8;
         let bar_width = inner_width.saturating_sub(name_width + mem_width + 4);
 
+        // Depths computed once per frame over a shared parent map instead
+        // of once per row.
+        let depths = if self.tree_mode {
+            forest_depths(self.processes)
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // Build list items with modern styling
         let items: Vec<ListItem> = self
             .processes
@@ -176,19 +184,17 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
                     _ => Span::styled("  ", Style::default()),
                 };
 
-                // Truncate name if needed; tree mode indents by ppid depth
+                // Truncate name if needed; tree mode indents by ppid depth.
+                // Truncation is char-boundary safe: byte slicing panics on
+                // multi-byte process names.
                 let prefix = if self.tree_mode {
-                    let depth = depth_of(self.processes, proc.pid).min(8);
+                    let depth = depths.get(&proc.pid).copied().unwrap_or(0).min(8);
                     format!("{}└ ", "  ".repeat(depth))
                 } else {
                     String::new()
                 };
                 let display = format!("{prefix}{}", proc.name);
-                let name = if display.len() > name_width {
-                    format!("{}…", &display[..name_width.saturating_sub(1)])
-                } else {
-                    format!("{:<width$}", display, width = name_width)
-                };
+                let name = truncate_to(&display, name_width);
 
                 // Name styling - brighter for selected, dimmer for lower ranks
                 let name_style = if is_selected {
@@ -288,6 +294,18 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
     }
 }
 
+/// Truncate to a character width with an ellipsis, never splitting a
+/// multi-byte character. Pads short strings to the width for column layout.
+fn truncate_to(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > max_chars {
+        let end = max_chars.saturating_sub(1);
+        format!("{}…", chars[..end].iter().collect::<String>())
+    } else {
+        format!("{text:<width$}", width = max_chars)
+    }
+}
+
 /// Create a sleek usage bar with partial blocks
 fn create_sleek_bar(percent: f64, width: usize) -> String {
     if width == 0 {
@@ -309,4 +327,18 @@ fn create_sleek_bar(percent: f64, width: usize) -> String {
     bar.push_str(&"░".repeat(remaining));
 
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_never_splits_characters() {
+        assert_eq!(truncate_to("abcdef", 4), "abc…");
+        assert_eq!(truncate_to("ab", 4), "ab  ");
+        // Multi-byte name: byte slicing would panic, chars do not.
+        assert_eq!(truncate_to("日本語プロセス", 4), "日本語…");
+        assert_eq!(truncate_to("", 4), "    ");
+    }
 }

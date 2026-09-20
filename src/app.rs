@@ -153,19 +153,38 @@ impl App {
             return;
         }
 
+        // The selected PID is gone (filtered out or exited): forget it so a
+        // stale PID cannot resurrect a wrong row later.
+        self.process_list_state.selected_pid = None;
         // Otherwise, ensure selection is valid
-        if let Some(selected) = self.process_list_state.list_state.selected()
+        if self.sorted_processes.is_empty() {
+            self.process_list_state.list_state.select(None);
+        } else if let Some(selected) = self.process_list_state.list_state.selected()
             && selected >= self.sorted_processes.len()
-            && !self.sorted_processes.is_empty()
         {
             self.process_list_state.list_state.select(Some(0));
         }
     }
 
-    /// Re-sort existing processes (for sort mode change)
+    /// Re-sort existing processes (for sort/filter/tree changes). Rebuilds
+    /// from the stored snapshot so filter toggles apply immediately instead
+    /// of waiting for the next tick; without a snapshot yet, re-sorts the
+    /// cached slice (filtering it is idempotent).
     fn resort_processes(&mut self) {
-        self.sort_and_order();
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.update_sorted_processes(&snapshot);
+        } else {
+            self.refilter_cached();
+            self.sort_and_order();
+        }
         self.update_selection();
+    }
+
+    /// Re-apply the filter to the cached slice (no snapshot yet).
+    fn refilter_cached(&mut self) {
+        let filter = self.process_list_state.filter;
+        self.sorted_processes
+            .retain(|process| filter.matches(process));
     }
 
     /// Sort, then optionally reorder into ppid preorder for tree mode.
@@ -494,6 +513,25 @@ mod tests {
             .unwrap();
         let child = pids.iter().position(|pid| *pid == 99).unwrap();
         assert!(parent < child);
+    }
+
+    #[test]
+    fn filter_toggle_applies_before_the_next_snapshot() {
+        let mut app = App::default();
+        app.update(crate::test_support::snapshot_at(
+            std::time::Instant::now(),
+            100,
+        ));
+        assert_eq!(app.processes().len(), 1);
+        // The fixture process shares memory: flipping the filter on must
+        // hide it immediately, without waiting for another tick.
+        app.process_list_state.filter = crate::process_view::ProcessFilter {
+            only_private: true,
+            ..Default::default()
+        };
+        app.resort_processes();
+        assert!(app.processes().is_empty());
+        assert!(app.process_list_state.selected_pid.is_none());
     }
 
     #[test]

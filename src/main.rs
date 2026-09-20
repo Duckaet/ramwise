@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     app.process_list_state.filter = process_view::ProcessFilter {
         only_private: args.only_private,
         only_shared: args.only_shared,
-        min_pss_bytes: args.min_pss * 1024 * 1024,
+        min_pss_bytes: args.min_pss.saturating_mul(1024 * 1024),
     };
 
     // Create collector
