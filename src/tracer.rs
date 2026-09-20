@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | bcc / bpftrace on PATH | `TBackend::Bcc` / `Bpftrace` | no helper backend |
 //! | kernel >= 5.8 | `TBackend::Native` (ring buffers) | native path unavailable |
-//! | tracefs mounted and listable | attaching any probe | read-only fallback only |
+//! | tracefs mounted and listable | attaching any probe | no attach without it |
 //! | euid 0 or unprivileged BPF allowed | loading programs | privileged operation denied |
 //! | target process identity (pid + starttime) | correlating events | process-scoped tracing refused |
 
@@ -59,7 +59,10 @@ pub enum BackendCapability {
 #[derive(Debug, Clone)]
 pub struct TracerCapabilities {
     pub kernel: (u64, u64),
-    pub privileged: bool,
+    /// Whether BPF programs may be loaded here: root, or unprivileged
+    /// BPF explicitly allowed. Named for the operation it gates, not for
+    /// privilege in general.
+    pub can_load_programs: bool,
     pub tracefs_accessible: bool,
     pub backends: Vec<(TracerBackend, BackendCapability)>,
 }
@@ -75,8 +78,8 @@ impl TracerCapabilities {
     /// Human-readable report for `--trace-alloc` and diagnostics.
     pub fn report(&self) -> String {
         let mut lines = vec![format!(
-            "kernel {}.{}, privileged: {}, tracefs accessible: {}",
-            self.kernel.0, self.kernel.1, self.privileged, self.tracefs_accessible
+            "kernel {}.{}, can load programs: {}, tracefs accessible: {}",
+            self.kernel.0, self.kernel.1, self.can_load_programs, self.tracefs_accessible
         )];
         for (backend, capability) in &self.backends {
             match capability {
@@ -99,7 +102,10 @@ impl TracerCapabilities {
 #[derive(Debug, Clone)]
 pub struct DetectionRoots {
     pub version_file: PathBuf,
-    pub tracefs_dir: PathBuf,
+    /// tracefs candidates in preference order; the first listable wins.
+    /// Kernels mount it at either `/sys/kernel/debug/tracing` (debugfs)
+    /// or `/sys/kernel/tracing` (standalone tracefs).
+    pub tracefs_dirs: Vec<PathBuf>,
     pub unprivileged_bpf_file: PathBuf,
     pub status_file: PathBuf,
     pub path_var: Option<std::ffi::OsString>,
@@ -109,7 +115,10 @@ impl Default for DetectionRoots {
     fn default() -> Self {
         Self {
             version_file: PathBuf::from("/proc/version"),
-            tracefs_dir: PathBuf::from("/sys/kernel/debug/tracing"),
+            tracefs_dirs: vec![
+                PathBuf::from("/sys/kernel/tracing"),
+                PathBuf::from("/sys/kernel/debug/tracing"),
+            ],
             unprivileged_bpf_file: PathBuf::from("/proc/sys/kernel/unprivileged_bpf_disabled"),
             status_file: PathBuf::from("/proc/self/status"),
             path_var: std::env::var_os("PATH"),
@@ -118,21 +127,38 @@ impl Default for DetectionRoots {
 }
 
 /// Parse `Linux version 6.8.0-...` into (major, minor); unknown → (0, 0).
+/// Release suffixes (`-generic`, `-rc1`) are stripped before parsing.
 pub fn parse_kernel_version(text: &str) -> (u64, u64) {
     let version = text
         .strip_prefix("Linux version ")
         .and_then(|rest| rest.split_whitespace().next())
         .unwrap_or("");
     let mut parts = version.split('.');
-    let major = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let numeric_prefix = |part: &str| {
+        part.chars()
+            .take_while(|cell| cell.is_ascii_digit())
+            .collect::<String>()
+    };
+    let major = parts
+        .next()
+        .and_then(|part| numeric_prefix(part).parse().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|part| numeric_prefix(part).parse().ok())
+        .unwrap_or(0);
     (major, minor)
 }
 
+/// Parse the *effective* UID (second column) from `/proc/self/status`.
+/// The real UID decides file access; the effective UID decides whether
+/// privileged BPF operations succeed, which is what detection gates on.
 fn read_uid(status_text: &str) -> Option<u32> {
     status_text.lines().find_map(|line| {
         let rest = line.strip_prefix("Uid:")?;
-        rest.split_whitespace().next()?.parse().ok()
+        let mut fields = rest.split_whitespace();
+        fields.next()?;
+        fields.next()?.parse().ok()
     })
 }
 
@@ -146,11 +172,14 @@ pub fn detect_capabilities(roots: &DetectionRoots) -> TracerCapabilities {
     let unprivileged_disabled = std::fs::read_to_string(&roots.unprivileged_bpf_file)
         .map(|text| text.trim() != "0")
         .unwrap_or(true);
-    let privileged = uid == 0 || !unprivileged_disabled;
+    let can_load_programs = uid == 0 || !unprivileged_disabled;
     // Probe mount presence by listing: a tracefs we cannot even list is
     // certainly not one we can attach to. Write access itself is validated
     // at attach time by the backend, not here.
-    let tracefs_accessible = std::fs::read_dir(&roots.tracefs_dir).is_ok();
+    let tracefs_accessible = roots
+        .tracefs_dirs
+        .iter()
+        .any(|dir| std::fs::read_dir(dir).is_ok());
 
     let backends = [
         TracerBackend::Bcc,
@@ -161,13 +190,19 @@ pub fn detect_capabilities(roots: &DetectionRoots) -> TracerCapabilities {
     .map(|backend| {
         (
             *backend,
-            backend_capability(*backend, roots, kernel, privileged, tracefs_accessible),
+            backend_capability(
+                *backend,
+                roots,
+                kernel,
+                can_load_programs,
+                tracefs_accessible,
+            ),
         )
     })
     .collect();
     TracerCapabilities {
         kernel,
-        privileged,
+        can_load_programs,
         tracefs_accessible,
         backends,
     }
@@ -177,7 +212,7 @@ fn backend_capability(
     backend: TracerBackend,
     roots: &DetectionRoots,
     kernel: (u64, u64),
-    privileged: bool,
+    can_load_programs: bool,
     tracefs_accessible: bool,
 ) -> BackendCapability {
     if let Some(binary) = backend.helper_binary()
@@ -188,7 +223,7 @@ fn backend_capability(
     if backend == TracerBackend::Native && (kernel.0 < 5 || (kernel.0 == 5 && kernel.1 < 8)) {
         return BackendCapability::Unavailable("needs kernel 5.8+ for BPF ring buffers".into());
     }
-    if !privileged {
+    if !can_load_programs {
         return BackendCapability::Unavailable("needs root or unprivileged BPF".into());
     }
     if !tracefs_accessible {
@@ -198,11 +233,19 @@ fn backend_capability(
 }
 
 fn binary_on_path(name: &str, path_var: Option<std::ffi::OsString>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     let Some(path_var) = path_var else {
         return false;
     };
-    std::env::split_paths(&path_var)
-        .any(|dir| !dir.as_os_str().is_empty() && dir.join(name).is_file())
+    std::env::split_paths(&path_var).any(|dir| {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Bounded lifecycle for a future allocation tracer. `start` validates
@@ -250,7 +293,8 @@ impl std::fmt::Display for TracerStartError {
 
 #[allow(dead_code)]
 impl AllocationTracer {
-    pub fn new(backend: TracerBackend, target_pid: i32, target_start_time: u64) -> Self {        Self {
+    pub fn new(backend: TracerBackend, target_pid: i32, target_start_time: u64) -> Self {
+        Self {
             backend,
             target_pid,
             target_start_time,
@@ -262,12 +306,13 @@ impl AllocationTracer {
 
     /// Start after validating backend, privilege and process identity.
     /// Common process identity (pid plus start time) correlates future
-    /// events; a zero start time refuses process-scoped tracing.
+    /// events; a zero start time refuses process-scoped tracing. PID 1
+    /// (init) is a legitimate target and is allowed.
     pub fn start(&mut self, capabilities: &TracerCapabilities) -> Result<(), TracerStartError> {
         if self.running {
             return Err(TracerStartError::AlreadyRunning);
         }
-        if self.target_pid <= 1 || self.target_start_time == 0 {
+        if self.target_pid <= 0 || self.target_start_time == 0 {
             return Err(TracerStartError::InvalidTarget(
                 "need a live PID with known start time".to_string(),
             ));
@@ -296,8 +341,12 @@ impl AllocationTracer {
         self.running
     }
 
-    /// Buffer one event, evicting the oldest past capacity.
+    /// Buffer one event, evicting the oldest past capacity. Events are
+    /// only buffered while running; a zero capacity disables buffering.
     pub fn push_event(&mut self, event: TracerEvent) {
+        if !self.running || self.capacity == 0 {
+            return;
+        }
         if self.events.len() >= self.capacity {
             self.events.pop_front();
         }
@@ -318,6 +367,7 @@ impl Drop for AllocationTracer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// Build fixture roots: version/status/sysctl files plus a tracefs dir,
     /// all under a unique temp dir. Missing pieces stay missing.
@@ -328,11 +378,11 @@ mod tests {
         with_tracefs: bool,
         path_var: Option<std::ffi::OsString>,
     ) -> (PathBuf, DetectionRoots) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ramwise-trace-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos())
+            "ramwise-trace-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, contents: &str| {
@@ -356,12 +406,25 @@ mod tests {
         }
         let roots = DetectionRoots {
             version_file,
-            tracefs_dir,
+            tracefs_dirs: vec![tracefs_dir],
             unprivileged_bpf_file,
             status_file,
             path_var,
         };
         (dir, roots)
+    }
+
+    fn cleanup(dir: &PathBuf) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn executable_fixture(dir: &Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
     }
 
     #[test]
@@ -376,40 +439,47 @@ mod tests {
     }
 
     #[test]
-    fn uid_parses_from_status_text() {
+    fn uid_parses_effective_uid_from_status_text() {
         assert_eq!(
             read_uid("Name:\tramwise\nUid:\t1000\t1000\t1000\t1000\n"),
             Some(1000)
         );
         assert_eq!(read_uid("Uid:\t0\t0\t0\t0\n"), Some(0));
+        // Setuid context: real 1000, effective 0 — detection gates on the
+        // effective identity that decides BPF success.
+        assert_eq!(read_uid("Uid:\t1000\t0\t0\t0\n"), Some(0));
         assert_eq!(read_uid("no uid here\n"), None);
     }
 
     #[test]
     fn missing_inputs_yield_reasons_not_panics() {
-        let (_dir, roots) = fixture_roots(None, None, None, false, None);
+        let (dir, roots) = fixture_roots(None, None, None, false, None);
         let capabilities = detect_capabilities(&roots);
         assert_eq!(capabilities.kernel, (0, 0));
-        assert!(!capabilities.privileged);
+        assert!(!capabilities.can_load_programs);
         assert!(!capabilities.tracefs_accessible);
         assert!(!capabilities.any_available());
         let report = capabilities.report();
         assert!(report.contains("not on PATH") || report.contains("needs kernel"));
         assert!(report.contains("normal monitoring continues"));
+        cleanup(&dir);
     }
 
     #[test]
     fn old_kernels_block_native_but_helpers_may_pass() {
         let bindir = std::env::temp_dir().join(format!(
-            "ramwise-trace-tools-{}",
+            "ramwise-trace-tools-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos())
         ));
         std::fs::create_dir_all(&bindir).unwrap();
-        std::fs::write(bindir.join("bpftrace"), "#!/bin/sh").unwrap();
-        let path_var: std::ffi::OsString = bindir.into_os_string();
-        let (_dir, roots) = fixture_roots(
+        executable_fixture(&bindir, "bpftrace");
+        // A non-executable file with the right name must not count.
+        std::fs::write(bindir.join("bcc-trace"), "#!/bin/sh").unwrap();
+        let path_var: std::ffi::OsString = bindir.clone().into_os_string();
+        let (dir, roots) = fixture_roots(
             Some("Linux version 5.4.0"),
             Some("Uid:\t0\t0\t0\t0\n"),
             Some("0"),
@@ -417,7 +487,7 @@ mod tests {
             Some(path_var),
         );
         let capabilities = detect_capabilities(&roots);
-        assert!(capabilities.privileged);
+        assert!(capabilities.can_load_programs);
         let native = capabilities
             .backends
             .iter()
@@ -434,11 +504,20 @@ mod tests {
             .unwrap();
         assert_eq!(bpftrace.1, BackendCapability::Available);
         assert!(capabilities.any_available());
+        let bcc = capabilities
+            .backends
+            .iter()
+            .find(|(backend, _)| *backend == TracerBackend::Bcc)
+            .unwrap();
+        // Present but not executable: still unavailable.
+        assert!(matches!(bcc.1, BackendCapability::Unavailable(_)));
+        cleanup(&dir);
+        cleanup(&bindir);
     }
 
     #[test]
     fn tracer_lifecycle_validates_identity_and_backend() {
-        let (_dir, roots) = fixture_roots(
+        let (dir, roots) = fixture_roots(
             Some("Linux version 6.8.0"),
             Some("Uid:\t0\t0\t0\t0\n"),
             Some("0"),
@@ -477,12 +556,16 @@ mod tests {
             missing_backend.start(&capabilities),
             Err(TracerStartError::BackendUnavailable(_))
         ));
+        let mut init_target = AllocationTracer::new(TracerBackend::Native, 1, 999);
+        assert!(init_target.start(&capabilities).is_ok());
+        cleanup(&dir);
     }
 
     #[test]
     fn event_buffer_is_bounded() {
         let mut tracer = AllocationTracer::new(TracerBackend::Native, 7, 7);
         tracer.capacity = 4;
+        tracer.running = true;
         for index in 0..10 {
             tracer.push_event(TracerEvent {
                 pid: 7,
@@ -490,5 +573,12 @@ mod tests {
             });
         }
         assert_eq!(tracer.buffered(), 4);
+        tracer.stop();
+        tracer.push_event(TracerEvent { pid: 7, bytes: 99 });
+        assert_eq!(tracer.buffered(), 0);
+        tracer.capacity = 0;
+        tracer.running = true;
+        tracer.push_event(TracerEvent { pid: 7, bytes: 99 });
+        assert_eq!(tracer.buffered(), 0);
     }
 }
