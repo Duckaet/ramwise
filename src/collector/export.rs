@@ -81,6 +81,9 @@ pub enum MemoryRegionKind {
 pub struct ExportProcessMemory {
     pub pid: i32,
     /// Clock ticks since boot; zero means unknown (see process identity).
+    /// Defaults on read so snapshots written before this field existed
+    /// still parse, with PID-only matching and its stated limitation.
+    #[serde(default)]
     pub start_time_ticks: u64,
     pub name: String,
     /// May contain sensitive command-line arguments; callers should sanitize before sharing.
@@ -301,6 +304,17 @@ mod tests {
     #[test]
     fn fixture_is_deterministic() {
         assert_eq!(ExportSnapshot::fixture(), ExportSnapshot::fixture());
+    }
+
+    #[test]
+    fn snapshots_predating_start_time_still_parse() {
+        let mut json = serde_json::to_value(ExportSnapshot::fixture()).unwrap();
+        for process in json["processes"].as_array_mut().unwrap() {
+            process.as_object_mut().unwrap().remove("start_time_ticks");
+        }
+        let decoded: ExportSnapshot = serde_json::from_value(json).unwrap();
+        assert!(decoded.processes.iter().all(|p| p.start_time_ticks == 0));
+        assert!(decoded.validate().is_ok());
     }
 
     #[test]
