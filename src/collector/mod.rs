@@ -6,11 +6,13 @@
 mod export;
 mod procfs_collector;
 mod types;
+mod writers;
 
 #[allow(unused_imports)]
 pub use export::{
     Capability, CollectorMetadata, ExportMemoryRegion, ExportProcessMemory, ExportSnapshot,
-    ExportSystemMemory, MemoryRegionKind, SnapshotExport,
+    ExportSystemMemory, MemoryRegionKind, SNAPSHOT_SCHEMA_VERSION, SnapshotExport,
 };
 pub use procfs_collector::Collector;
 pub use types::{MemorySnapshot, ProcessMemory, SystemMemory};
+pub use writers::{render_csv, render_json, write_target};
