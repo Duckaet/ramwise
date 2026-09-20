@@ -64,6 +64,47 @@ ramwise --debug
 
 # Use light mode
 ramwise -t light
+
+# One JSON snapshot to stdout (pipes and scripts)
+ramwise --once
+
+# One status line: mem used/total pct pressure swap (optional swap io)
+ramwise --tiny
+```
+
+Example tiny output (stable, locale-independent fields):
+
+```text
+mem 8.0G/16.0G 50.0% stable swap 512.0M/4.0G io 10.0/20.0pg/s
+```
+
+The trailing `io` segment appears only once swap-activity rates are known
+(from the second sample on); pressure reads `stable`, `elevated`,
+`critical`, or `unknown` when inputs are unavailable.
+
+## Status bar integration
+
+```ini
+# Waybar (custom module, polling every 5s)
+"custom/ramwise": {
+    "exec": "ramwise --tiny --once",
+    "interval": 5,
+    "format": "{}"
+}
+```
+
+```tmux
+# tmux status-right (polling every 5s)
+set -g status-interval 5
+set -g status-right "#(ramwise --tiny --once)"
+```
+
+```ini
+# Polybar (custom script module)
+[module/ramwise]
+type = custom/script
+exec = ramwise --tiny --once
+interval = 5
 ```
 
 ## Keyboard Shortcuts

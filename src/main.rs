@@ -126,18 +126,27 @@ fn snapshot_to_json(snapshot: &collector::MemorySnapshot) -> Result<String> {
 
 /// Render the one-line status summary for `--tiny`.
 ///
-/// Provisional shape until the stable status-bar contract lands: used/total
-/// RAM, usage percent, and used/total swap. Pure and deterministic so golden
-/// tests pin it exactly.
+/// Stable contract: space-separated fields, locale-independent formatting
+/// (Rust `format!` never localizes numbers), no unbounded strings, fixed
+/// field order — `mem <used>/<total> <pct> <pressure> swap <used>/<total>`
+/// with an optional trailing `io <in>/<out>pg/s` swap-activity segment that
+/// appears only when sample-to-sample rates are known. Pure and
+/// deterministic: the same snapshot always renders the same line.
 fn render_tiny_line(system: &collector::SystemMemory) -> String {
-    format!(
-        "mem {}/{} {} swap {}/{}",
+    let level = analyzer::classify(system, &analyzer::PressureThresholds::default());
+    let mut line = format!(
+        "mem {}/{} {} {} swap {}/{}",
         utils::format_bytes(system.used()),
         utils::format_bytes(system.total),
         utils::format_percent(system.usage_percent()),
+        level.label(),
         utils::format_bytes(system.swap_used),
         utils::format_bytes(system.swap_total),
-    )
+    );
+    if let (Some(in_rate), Some(out_rate)) = (system.swap_in_rate, system.swap_out_rate) {
+        line.push_str(&format!(" io {in_rate:.1}/{out_rate:.1}pg/s"));
+    }
+    line
 }
 
 #[tokio::main]
@@ -534,7 +543,26 @@ mod tests {
     #[test]
     fn tiny_line_is_pinned_by_a_golden_fixture() {
         let line = render_tiny_line(&test_support::system_memory());
-        assert_eq!(line, "mem 8.0G/16.0G 50.0% swap 512.0M/4.0G");
+        assert_eq!(line, "mem 8.0G/16.0G 50.0% stable swap 512.0M/4.0G");
+    }
+
+    #[test]
+    fn tiny_line_appends_swap_activity_only_when_known() {
+        let mut system = test_support::system_memory();
+        system.swap_in_rate = Some(10.0);
+        system.swap_out_rate = Some(20.0);
+        assert_eq!(
+            render_tiny_line(&system),
+            "mem 8.0G/16.0G 50.0% stable swap 512.0M/4.0G io 10.0/20.0pg/s"
+        );
+        system.swap_in_rate = None;
+        assert!(!render_tiny_line(&system).contains("io "));
+    }
+
+    #[test]
+    fn tiny_line_marks_unknown_pressure_explicitly() {
+        let line = render_tiny_line(&collector::SystemMemory::default());
+        assert_eq!(line, "mem 0B/0B 0.00% unknown swap 0B/0B");
     }
 
     #[test]
