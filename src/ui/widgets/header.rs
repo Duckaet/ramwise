@@ -122,29 +122,30 @@ impl<'a> Widget for HeaderWidget<'a> {
             Span::styled(" Quit ", self.theme.muted_style()),
         ];
 
-        // Combine all parts. Narrow terminals degrade gracefully: below 70
-        // cells the swap segment is dropped but the pressure level survives;
-        // below 40 cells only title plus level remain.
+        // Combine in priority order — title, RAM, pressure, swap, help —
+        // so narrow terminals degrade gracefully: each segment joins only
+        // when it fits, and the pressure level always survives (full label
+        // when room allows, single glyph otherwise).
         let level = classify(sys, &PressureThresholds::default());
+        let width = area.width as usize;
         let mut spans = vec![title, dot.clone()];
-        if area.width >= 40 {
-            spans.extend(ram);
-            if area.width >= 70 {
-                spans.extend(swap);
+        let mut pressure_shown = false;
+        let pressure_full = pressure_spans(level, self.theme);
+        let candidates = [&ram, &pressure_full, &swap, &help];
+        for (index, candidate) in candidates.iter().enumerate() {
+            let used: usize = spans.iter().map(|span| span.width()).sum();
+            let extra: usize = candidate.iter().map(|span| span.width()).sum();
+            if used + extra <= width {
+                spans.extend(candidate.iter().cloned());
+                pressure_shown = pressure_shown || index == 1;
             }
-            spans.extend(pressure_spans(level, self.theme));
-        } else {
-            spans.push(pressure_glyph(level, self.theme));
         }
-
-        // Calculate padding for right alignment
-        let content_width: usize = spans.iter().map(|s| s.width()).sum();
-        let help_width: usize = help.iter().map(|s| s.width()).sum();
-        let padding = (area.width as usize).saturating_sub(content_width + help_width);
-        if padding > 0 {
-            spans.push(Span::raw(" ".repeat(padding)));
+        if !pressure_shown {
+            let used: usize = spans.iter().map(|span| span.width()).sum();
+            if used < width {
+                spans.push(pressure_glyph(level, self.theme));
+            }
         }
-        spans.extend(help);
 
         let line = Line::from(spans);
         let paragraph = Paragraph::new(line).style(Style::default().bg(self.theme.bg_elevated));
@@ -174,10 +175,10 @@ fn create_sleek_bar(percent: f64, width: usize) -> String {
 
 /// Color for a pressure level; unknown renders dim so absence of data is
 /// visible rather than silently green.
-fn level_color(level: PressureLevel, theme: &Theme) -> ratatui::style::Color {
+pub(crate) fn pressure_color(level: PressureLevel, theme: &Theme) -> ratatui::style::Color {
     match level {
         PressureLevel::Unknown => theme.fg_dim,
-        PressureLevel::Normal => theme.success,
+        PressureLevel::Stable => theme.success,
         PressureLevel::Elevated => theme.warning,
         PressureLevel::Critical => theme.error,
     }
@@ -185,7 +186,7 @@ fn level_color(level: PressureLevel, theme: &Theme) -> ratatui::style::Color {
 
 /// Full pressure segment: separator, label, colored glyph, level name.
 fn pressure_spans(level: PressureLevel, theme: &Theme) -> Vec<Span<'static>> {
-    let color = level_color(level, theme);
+    let color = pressure_color(level, theme);
     vec![
         Span::styled(" · ", theme.muted_style()),
         Span::styled("Pressure ", Style::default().fg(theme.fg_dim)),
@@ -199,7 +200,7 @@ fn pressure_spans(level: PressureLevel, theme: &Theme) -> Vec<Span<'static>> {
 
 /// Single-cell glyph for very narrow terminals.
 fn pressure_glyph(level: PressureLevel, theme: &Theme) -> Span<'static> {
-    let color = level_color(level, theme);
+    let color = pressure_color(level, theme);
     let glyph = match level {
         PressureLevel::Unknown => "?",
         _ => "●",
@@ -236,17 +237,39 @@ mod tests {
     fn header_survives_narrow_terminals() {
         let theme = Theme::dark();
         let system = test_support::system_memory();
-        for width in [20, 39, 40, 69, 70] {
+        for width in [20, 30, 40, 60, 69, 70, 80, 120] {
             let area = Rect::new(0, 0, width, 1);
             let mut buf = Buffer::empty(area);
             HeaderWidget::new(&system, &theme).render(area, &mut buf);
             let text = buffer_text(&buf);
             assert!(text.contains("ramwise"), "width {width}: {text}");
+            // The pressure level always survives: full label or glyph.
+            assert!(
+                text.contains("stable") || text.contains('●'),
+                "width {width}: {text}"
+            );
         }
-        let tiny = Rect::new(0, 0, 20, 1);
-        let mut buf = Buffer::empty(tiny);
-        HeaderWidget::new(&system, &theme).render(tiny, &mut buf);
-        assert!(buffer_text(&buf).contains('●'));
+    }
+
+    #[test]
+    fn header_tiers_drop_help_swap_and_ram_in_order() {
+        let theme = Theme::dark();
+        let system = test_support::system_memory();
+        let render = |width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = Buffer::empty(area);
+            HeaderWidget::new(&system, &theme).render(area, &mut buf);
+            buffer_text(&buf)
+        };
+        let full = render(130);
+        assert!(full.contains("Quit"));
+        assert!(full.contains("Swap"));
+        let medium = render(80);
+        assert!(medium.contains("stable"));
+        assert!(!medium.contains("Quit"));
+        let small = render(30);
+        assert!(small.contains('●'));
+        assert!(!small.contains("RAM "));
     }
 
     #[test]

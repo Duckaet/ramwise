@@ -203,14 +203,9 @@ impl<'a> Widget for InsightsPanelWidget<'a> {
 
 /// First-row pressure summary: level plus used-versus-available explanation.
 fn pressure_line(system: &SystemMemory, theme: &Theme) -> Line<'static> {
-    use crate::analyzer::{PressureLevel, PressureThresholds, classify, explain};
+    use crate::analyzer::{PressureThresholds, classify, explain};
     let level = classify(system, &PressureThresholds::default());
-    let color = match level {
-        PressureLevel::Unknown => theme.fg_dim,
-        PressureLevel::Normal => theme.success,
-        PressureLevel::Elevated => theme.warning,
-        PressureLevel::Critical => theme.error,
-    };
+    let color = super::header::pressure_color(level, theme);
     Line::from(vec![
         Span::styled(" ● ", Style::default().fg(color)),
         Span::styled(
@@ -235,4 +230,62 @@ fn count_by_severity(insights: &[&Insight]) -> (usize, usize, usize) {
     }
 
     (crit, warn, info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Severity;
+    use crate::collector::SystemMemory;
+    use crate::test_support;
+    use crate::ui::Theme;
+
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn pressure_line_shows_with_empty_insights() {
+        let theme = Theme::dark();
+        let system = test_support::system_memory();
+        let area = Rect::new(0, 0, 130, 6);
+        let mut buf = Buffer::empty(area);
+        InsightsPanelWidget::new(vec![], &theme)
+            .pressure(&system)
+            .render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Pressure"));
+        assert!(text.contains("stable"));
+        assert!(text.contains("available for new applications"));
+    }
+
+    #[test]
+    fn pressure_line_reserves_a_row_alongside_insights() {
+        let theme = Theme::dark();
+        let system = test_support::system_memory();
+        let insight = Insight::new("hog_1", Severity::Warning, "hog", "detail", "free memory");
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        InsightsPanelWidget::new(vec![&insight], &theme)
+            .pressure(&system)
+            .render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Pressure"));
+        assert!(text.contains("hog"));
+    }
+
+    #[test]
+    fn tiny_panel_clips_insights_but_keeps_pressure() {
+        let theme = Theme::dark();
+        let system = SystemMemory::default();
+        let insight = Insight::new("hog_1", Severity::Warning, "hog", "detail", "free memory");
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buf = Buffer::empty(area);
+        InsightsPanelWidget::new(vec![&insight], &theme)
+            .pressure(&system)
+            .render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("unknown"));
+        assert!(!text.contains("hog"));
+    }
 }

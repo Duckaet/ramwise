@@ -4,7 +4,7 @@
 //! four levels:
 //!
 //! - **Unknown** — no usable input (`total == 0`); rendered dim, never as zero.
-//! - **Normal (green)** — comfortably below every threshold.
+//! - **Stable (green)** — comfortably below every threshold.
 //! - **Elevated (yellow)** — worth watching; sustained pressure building.
 //! - **Critical (red)** — act now; OOM risk or heavy swapping.
 //!
@@ -19,7 +19,7 @@ use crate::collector::SystemMemory;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PressureLevel {
     Unknown,
-    Normal,
+    Stable,
     Elevated,
     Critical,
 }
@@ -29,7 +29,7 @@ impl PressureLevel {
     pub fn label(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
-            Self::Normal => "stable",
+            Self::Stable => "stable",
             Self::Elevated => "elevated",
             Self::Critical => "critical",
         }
@@ -75,15 +75,20 @@ impl Default for PressureThresholds {
 ///
 /// Swap conditions only apply when the machine actually has swap
 /// (`swap_total > 0`); swap-less machines classify purely on RAM so a zero
-/// swap total can never inflate or deflate the level. Unknown swap rates
-/// (`None`, e.g. the first sample) contribute nothing.
+/// swap total can never inflate or deflate the level — including through
+/// swap-activity rates, which require real swap to be meaningful. Unknown
+/// swap rates (`None`, e.g. the first sample) contribute nothing.
 pub fn classify(system: &SystemMemory, thresholds: &PressureThresholds) -> PressureLevel {
     if system.total == 0 {
         return PressureLevel::Unknown;
     }
     let used_pct = system.usage_percent();
     let swap_pct = system.swap_percent();
-    let swap_out_rate = system.swap_out_rate.unwrap_or(0.0);
+    let swap_out_rate = if system.swap_total > 0 {
+        system.swap_out_rate.unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
     let critical = used_pct >= thresholds.red_used_pct
         || (system.swap_total > 0 && swap_pct >= thresholds.red_swap_pct)
@@ -99,7 +104,7 @@ pub fn classify(system: &SystemMemory, thresholds: &PressureThresholds) -> Press
         return PressureLevel::Elevated;
     }
 
-    PressureLevel::Normal
+    PressureLevel::Stable
 }
 
 /// Used-versus-available explanation for the header and insights panel.
@@ -140,11 +145,11 @@ mod tests {
         let thresholds = PressureThresholds::default();
         assert_eq!(
             classify(&system_with(0.0), &thresholds),
-            PressureLevel::Normal
+            PressureLevel::Stable
         );
         assert_eq!(
             classify(&system_with(74.9), &thresholds),
-            PressureLevel::Normal
+            PressureLevel::Stable
         );
         assert_eq!(
             classify(&system_with(75.0), &thresholds),
@@ -169,7 +174,7 @@ mod tests {
         assert_eq!(classify(&system, &thresholds), PressureLevel::Critical);
 
         let calm = system_with(10.0);
-        assert_eq!(classify(&calm, &thresholds), PressureLevel::Normal);
+        assert_eq!(classify(&calm, &thresholds), PressureLevel::Stable);
     }
 
     #[test]
@@ -184,6 +189,29 @@ mod tests {
     }
 
     #[test]
+    fn swap_fill_boundaries_are_exact() {
+        let thresholds = PressureThresholds::default();
+        let mut system = system_with(10.0);
+        system.swap_total = 100;
+        system.swap_used = 49;
+        assert_eq!(classify(&system, &thresholds), PressureLevel::Stable);
+        system.swap_used = 50;
+        assert_eq!(classify(&system, &thresholds), PressureLevel::Elevated);
+        system.swap_used = 80;
+        assert_eq!(classify(&system, &thresholds), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn swap_less_machines_ignore_swap_activity() {
+        let thresholds = PressureThresholds::default();
+        let mut system = system_with(10.0);
+        system.swap_total = 0;
+        system.swap_used = 0;
+        system.swap_out_rate = Some(2500.0);
+        assert_eq!(classify(&system, &thresholds), PressureLevel::Stable);
+    }
+
+    #[test]
     fn swap_activity_drives_the_level_without_swap_fill() {
         let thresholds = PressureThresholds::default();
         let mut system = system_with(10.0);
@@ -194,7 +222,7 @@ mod tests {
         system.swap_out_rate = Some(2500.0);
         assert_eq!(classify(&system, &thresholds), PressureLevel::Critical);
         system.swap_out_rate = None;
-        assert_eq!(classify(&system, &thresholds), PressureLevel::Normal);
+        assert_eq!(classify(&system, &thresholds), PressureLevel::Stable);
     }
 
     #[test]
@@ -219,14 +247,14 @@ mod tests {
         );
         assert_eq!(
             classify(&system_with(55.0), &PressureThresholds::default()),
-            PressureLevel::Normal
+            PressureLevel::Stable
         );
     }
 
     #[test]
     fn explanation_states_used_versus_available() {
         let system = test_support::system_memory();
-        let text = explain(&system, PressureLevel::Normal);
+        let text = explain(&system, PressureLevel::Stable);
         assert!(text.contains("stable"));
         assert!(text.contains("available for new applications"));
     }
