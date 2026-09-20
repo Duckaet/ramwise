@@ -47,8 +47,8 @@ use ui::widgets::{
 #[command(name = "ramwise")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Update interval in milliseconds
-    #[arg(short, long, default_value = "1000")]
+    /// Update interval in milliseconds (must be positive)
+    #[arg(short, long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 
     /// Minimum process RSS to display (in MB)
@@ -68,7 +68,8 @@ struct Args {
     theme: String,
 
     /// Print one compact JSON snapshot to stdout and exit (exit 0 on
-    /// success, non-zero when collection fails; diagnostics go to stderr)
+    /// success, non-zero when collection fails; diagnostics go to stderr).
+    /// Combines with --tiny: JSON prints first, then the status line.
     #[arg(long, conflicts_with = "watch")]
     once: bool,
 
@@ -151,7 +152,7 @@ fn execution_mode(args: &Args) -> ExecutionMode {
 fn build_collector(args: &Args) -> Collector {
     Collector::new()
         .with_interval(Duration::from_millis(args.interval))
-        .with_min_rss(args.min_rss * 1024 * 1024)
+        .with_min_rss(args.min_rss.saturating_mul(1024 * 1024))
         .with_smaps(!args.no_smaps)
 }
 
@@ -252,6 +253,12 @@ async fn main() -> Result<()> {
     if mode == ExecutionMode::Tui && exports.is_none() {
         return run_tui(&args).await;
     }
+    check_stdout_payloads(&args)?;
+    if args.export_details && args.no_smaps {
+        eprintln!(
+            "warning: --export-details has no effect with --no-smaps (region detail unavailable)"
+        );
+    }
     // Single-shot data path. Requesting an export implies one collection
     // like --once; --tiny additionally prints the status line.
     let collector = build_collector(&args);
@@ -267,6 +274,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         ExecutionMode::TinyOnce => {
+            // Explicit --once composes: JSON payload first (pipelines read
+            // it with head -1), then the status line.
+            if args.once {
+                println!("{}", snapshot_to_json(&snapshot)?);
+            }
             println!("{}", render_tiny_line(&snapshot.system));
             Ok(())
         }
@@ -297,8 +309,44 @@ fn run_compare(
     Ok(())
 }
 
-/// Print the tiny line every interval until interrupted. A clean Ctrl-C ends
-/// with exit 0; a collection failure ends non-zero with the cause on stderr.
+/// At most one stdout data payload, so pipelines stay unambiguous.
+/// The single exception is the documented `--once --tiny` dual output
+/// (JSON first, then the status line); every other combination of stdout
+/// producers (JSON print, tiny line, `-` export targets) fails fast.
+fn check_stdout_payloads(args: &Args) -> Result<()> {
+    let mut payloads = 0;
+    if args.once {
+        payloads += 1;
+    }
+    if args.tiny && !args.watch {
+        payloads += 1;
+    }
+    for target in [args.export_json.as_ref(), args.export_csv.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if target.as_os_str() == "-" {
+            payloads += 1;
+        }
+    }
+    let documented_dual = args.once && args.tiny && !args.watch && payloads == 2;
+    if payloads > 1 && !documented_dual {
+        anyhow::bail!(
+            "multiple stdout payloads requested; write exports to files or request a single output"
+        );
+    }
+    Ok(())
+}
+
+/// Flush stdout so piped consumers see each line immediately.
+fn flush_stdout() -> Result<()> {
+    use std::io::Write as _;
+    io::stdout().flush().context("Failed to flush stdout")
+}
+
+/// Print the tiny line every interval until interrupted (SIGINT or
+/// SIGTERM). A clean interrupt ends with exit 0; a collection failure ends
+/// non-zero with the cause on stderr.
 async fn run_tiny_watch(args: &Args) -> Result<()> {
     let collector = build_collector(args);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
@@ -307,13 +355,30 @@ async fn run_tiny_watch(args: &Args) -> Result<()> {
             _ = ticker.tick() => {
                 let snapshot = collector.collect_snapshot()?;
                 println!("{}", render_tiny_line(&snapshot.system));
+                flush_stdout()?;
             }
             result = tokio::signal::ctrl_c() => {
                 result.context("Failed to listen for interrupt")?;
                 return Ok(());
             }
+            _ = terminate_signal() => {
+                return Ok(());
+            }
         }
     }
+}
+
+/// SIGTERM waiter; pending forever off unix (Linux-only binary, but the
+/// gate keeps cross-compilation honest).
+async fn terminate_signal() {
+    #[cfg(unix)]
+    if let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        terminate.recv().await;
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
 }
 
 async fn run_tui(args: &Args) -> Result<()> {
@@ -629,6 +694,11 @@ mod tests {
             execution_mode(&args_with(true, false, true)),
             ExecutionMode::TinyWatch
         );
+        // Clap rejects --once --watch, but the dispatcher stays total:
+        // watch wins deterministically if both ever arrive.
+        let mut both = args_with(true, true, false);
+        both.watch = true;
+        assert_eq!(execution_mode(&both), ExecutionMode::TinyWatch);
     }
 
     #[test]
@@ -658,6 +728,19 @@ mod tests {
         let plain = args_with(false, true, false);
         let collector = build_collector(&plain);
         assert!(collector.collect_snapshot().is_ok());
+
+        // --no-smaps disables detailed PSS/USS collection end to end.
+        let bare = Args {
+            no_smaps: true,
+            min_rss: 0,
+            ..args_with(false, true, false)
+        };
+        let collector = build_collector(&bare);
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert!(
+            snapshot.processes.iter().all(|p| p.pss == 0 && p.uss == 0),
+            "smaps details must stay off with --no-smaps"
+        );
     }
 
     #[test]
@@ -695,5 +778,20 @@ mod tests {
                 details: true,
             })
         );
+    }
+
+    #[test]
+    fn stdout_payload_rule_allows_only_the_documented_dual() {
+        assert!(check_stdout_payloads(&args_with(false, true, false)).is_ok());
+        assert!(check_stdout_payloads(&args_with(true, false, false)).is_ok());
+        // --once --tiny is the documented dual output.
+        let mut dual = args_with(true, true, false);
+        assert!(check_stdout_payloads(&dual).is_ok());
+        // A second stdout producer on top refuses fast.
+        dual.export_csv = Some(std::path::PathBuf::from("-"));
+        assert!(check_stdout_payloads(&dual).is_err());
+        let mut mixed = args_with(false, true, false);
+        mixed.export_json = Some(std::path::PathBuf::from("-"));
+        assert!(check_stdout_payloads(&mixed).is_err());
     }
 }
