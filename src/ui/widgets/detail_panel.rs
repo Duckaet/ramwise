@@ -8,13 +8,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use crate::collector::ProcessMemory;
+use crate::accounting::{composition_segments, system_notes};
+use crate::collector::{ProcessMemory, SystemMemory};
 use crate::ui::Theme;
 use crate::utils::format_bytes;
 
 /// Modern detail panel widget
 pub struct DetailPanelWidget<'a> {
     process: Option<&'a ProcessMemory>,
+    system: Option<&'a SystemMemory>,
     theme: &'a Theme,
     focused: bool,
 }
@@ -23,6 +25,7 @@ impl<'a> DetailPanelWidget<'a> {
     pub fn new(process: Option<&'a ProcessMemory>, theme: &'a Theme) -> Self {
         Self {
             process,
+            system: None,
             theme,
             focused: false,
         }
@@ -30,6 +33,13 @@ impl<'a> DetailPanelWidget<'a> {
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// Attach system metrics for the composition bar scale and the
+    /// accounting-education section.
+    pub fn system(mut self, system: &'a SystemMemory) -> Self {
+        self.system = Some(system);
         self
     }
 }
@@ -202,6 +212,46 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             self.theme,
         ));
 
+        // Stacked composition bar: private/shared/swap as RSS fractions.
+        // Only collected segments render; unavailable types leave no gap.
+        let segments = composition_segments(proc);
+        if !segments.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(section_header("Composition", self.theme));
+            lines.push(Line::from(composition_bar(&segments, self.theme)));
+            for segment in &segments {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", segment.label), self.theme.muted_style()),
+                    Span::styled(
+                        format_bytes(segment.bytes),
+                        Style::default().fg(self.theme.fg_dim),
+                    ),
+                    Span::styled(
+                        format!(" ({:.0}%)", segment.fraction * 100.0),
+                        self.theme.muted_style(),
+                    ),
+                ]));
+            }
+        }
+
+        // System accounting education with explicit caveats.
+        let notes = self.system.map(system_notes).unwrap_or_default();
+        if !notes.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(section_header("Accounting", self.theme));
+            for note in &notes {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}: ", note.label),
+                        Style::default()
+                            .fg(self.theme.secondary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(&note.text, self.theme.muted_style()),
+                ]));
+            }
+        }
+
         // Swap indicator (if any)
         if proc.swap > 0 {
             lines.push(Line::from(""));
@@ -349,6 +399,26 @@ fn create_mini_bar(percent: f64, width: usize) -> String {
     bar
 }
 
+/// Stacked composition bar: one glyph run per segment, widths proportional
+/// to RSS fractions. Colors distinguish types; the legend lines below the
+/// bar carry the labels and byte values.
+fn composition_bar(
+    segments: &[crate::accounting::CompositionSegment],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    const WIDTH: usize = 24;
+    let palette = [theme.primary, theme.secondary, theme.warning, theme.fg_dim];
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    for (index, segment) in segments.iter().enumerate() {
+        let width = (segment.fraction * WIDTH as f64).round() as usize;
+        spans.push(Span::styled(
+            "█".repeat(width.max(1)),
+            Style::default().fg(palette[index % palette.len()]),
+        ));
+    }
+    spans
+}
+
 /// State chip with icon
 fn state_chip(state: char) -> String {
     match state {
@@ -360,5 +430,49 @@ fn state_chip(state: char) -> String {
         't' => "◻ Tracing".to_string(),
         'I' => "◌ Idle".to_string(),
         _ => format!("? {}", state),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn detail_panel_shows_composition_and_accounting() {
+        let theme = Theme::dark();
+        let process = test_support::process(100 * 1024 * 1024);
+        let system = test_support::system_memory();
+        let area = Rect::new(0, 0, 60, 40);
+        let mut buf = Buffer::empty(area);
+        DetailPanelWidget::new(Some(&process), &theme)
+            .system(&system)
+            .render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Composition"));
+        assert!(text.contains("private"));
+        assert!(text.contains("Accounting"));
+        assert!(text.contains("available"));
+        assert!(text.contains("reclaimable") || text.contains("reclaimed"));
+    }
+
+    #[test]
+    fn detail_panel_omits_swap_section_without_swap() {
+        let theme = Theme::dark();
+        let process = test_support::process(100 * 1024 * 1024);
+        let mut system = test_support::system_memory();
+        system.swap_total = 0;
+        system.swap_used = 0;
+        let area = Rect::new(0, 0, 60, 40);
+        let mut buf = Buffer::empty(area);
+        DetailPanelWidget::new(Some(&process), &theme)
+            .system(&system)
+            .render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("not configured"));
     }
 }

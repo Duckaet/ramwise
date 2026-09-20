@@ -3,6 +3,7 @@
 //! A TUI application that provides deep memory introspection,
 //! intelligent insights, and beautiful visualization.
 
+mod accounting;
 mod analyzer;
 mod app;
 mod categories;
@@ -194,6 +195,10 @@ async fn run_app(
             // Detail panel
             let detail = DetailPanelWidget::new(app.selected_process(), &app.theme)
                 .focused(app.focus == Focus::DetailPanel);
+            let detail = match &app.snapshot {
+                Some(snapshot) => detail.system(&snapshot.system),
+                None => detail,
+            };
             frame.render_widget(detail, areas.detail_panel);
 
             // Graph panel
