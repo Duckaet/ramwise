@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::collector::MemorySnapshot;
 use crate::history::HistoryBuffer;
@@ -334,7 +334,12 @@ impl Rule for FragmentationDetector {
 /// Where the binary detector fires on a growth threshold, this rule reports
 /// the calibrated 0–100 score with its components, so borderline cases show
 /// *why* they are (or are not) convincing. Only scores at or above
-/// `min_score` produce insights.
+/// `min_score` produce insights. The 10 MB floor is deliberately more
+/// sensitive than the binary detector's 50 MB: grading weak evidence is
+/// safe, paging on it is not.
+///
+/// Both detectors may fire on a strong leak with distinct insight IDs
+/// (`leak_` vs `leak_score_`); the score explains the binary trip.
 pub struct LeakScoreRule {
     /// Minimum score to report.
     pub min_score: u8,
@@ -368,10 +373,24 @@ impl Rule for LeakScoreRule {
             if trend.len() < 3 {
                 continue;
             }
-            let rss: Vec<u64> = trend.iter().map(|(_, value)| *value).collect();
-            let duration = trend
+            // Score only the configured trailing window: ancient history
+            // must not dilute (or rescue) recent behavior.
+            let last = trend
                 .last()
-                .map(|(end, _)| end.saturating_duration_since(trend[0].0))
+                .map(|(timestamp, _)| *timestamp)
+                .unwrap_or_else(Instant::now);
+            let cutoff = last.checked_sub(self.window).unwrap_or_else(|| trend[0].0);
+            let windowed: Vec<(Instant, u64)> = trend
+                .into_iter()
+                .filter(|(timestamp, _)| *timestamp >= cutoff)
+                .collect();
+            if windowed.len() < 3 {
+                continue;
+            }
+            let rss: Vec<u64> = windowed.iter().map(|(_, value)| *value).collect();
+            let duration = windowed
+                .last()
+                .map(|(end, _)| end.saturating_duration_since(windowed[0].0))
                 .unwrap_or(Duration::ZERO);
             let assessed = leak_score(LeakScoreInput {
                 rss: &rss,
@@ -549,5 +568,56 @@ mod tests {
                 .evaluate(&snapshot, &calm_history)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn leak_score_rule_scores_only_the_trailing_window() {
+        use crate::collector::ProcessMemory;
+        let base = std::time::Instant::now();
+        let mut history = HistoryBuffer::new(30, Duration::from_secs(600));
+        // Ancient flat history must not rescue recent growth from scoring:
+        // the rule sees only the last `window`.
+        for index in 0..10u64 {
+            history.push(&crate::collector::MemorySnapshot {
+                timestamp: base + Duration::from_secs(index),
+                system: crate::collector::SystemMemory::default(),
+                processes: vec![ProcessMemory {
+                    pid: 778,
+                    name: "grower".into(),
+                    rss: 20 * 1024 * 1024,
+                    vss: 20 * 1024 * 1024,
+                    ..Default::default()
+                }],
+                total_processes: 1,
+                running_processes: 1,
+            });
+        }
+        for index in 0..10u64 {
+            let rss = 20 * 1024 * 1024 + index * 2 * 1024 * 1024;
+            history.push(&crate::collector::MemorySnapshot {
+                timestamp: base + Duration::from_secs(400 + index),
+                system: crate::collector::SystemMemory::default(),
+                processes: vec![ProcessMemory {
+                    pid: 778,
+                    name: "grower".into(),
+                    rss,
+                    vss: rss,
+                    ..Default::default()
+                }],
+                total_processes: 1,
+                running_processes: 1,
+            });
+        }
+        let mut snapshot = test_support::snapshot_at(
+            std::time::Instant::now(),
+            20 * 1024 * 1024 + 9 * 2 * 1024 * 1024,
+        );
+        snapshot.processes[0].pid = 778;
+        let rule = LeakScoreRule {
+            window: Duration::from_secs(60),
+            ..LeakScoreRule::default()
+        };
+        let insight = rule.evaluate(&snapshot, &history).unwrap();
+        assert!(insight.id.starts_with("leak_score_778"));
     }
 }

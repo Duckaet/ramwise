@@ -14,13 +14,21 @@
 //!   approach 1; sawtooth noise lands near 0.5.
 //! - **stability**: `1 − stdev/mean`, clamped to 0–1. Noise destroys
 //!   confidence even when the endpoints moved.
-//! - **coverage**: `min(1, samples / 10)`. Few points, little trust.
+//! - **coverage**: sample trust (`n/10`) times duration trust
+//!   (`duration/60s`), each capped at 1. Ten points over a minute earn full
+//!   coverage; a ten-second burst does not, no matter how steep.
 //!
 //! Guards: fewer than 3 samples, a non-positive duration, or a peak below
 //! `min_size_bytes` all score 0 with zeroed components, so tiny or
 //! barely-observed processes can never look leaky.
 //!
 //! Bands: 0–24 low, 25–49 watch, 50–74 likely, 75–100 severe.
+//!
+//! Complement to [`crate::analyzer::rules::MemoryLeakDetector`]: the binary
+//! detector trips on a growth threshold (conservative, 50 MB floor); this
+//! score grades the evidence (sensitive, 10 MB floor). Both may fire on a
+//! strong leak — the score explains *why* it is convincing — while weak or
+//! brief climbs surface only as a low score, never as an insight.
 
 use std::time::Duration;
 
@@ -106,14 +114,17 @@ pub fn leak_score(input: LeakScoreInput<'_>) -> LeakScore {
     let growth = ((end - start) / start).min(1.0);
     let ascending = rss.windows(2).filter(|pair| pair[1] > pair[0]).count();
     let monotonicity = ascending as f64 / (rss.len() - 1) as f64;
-    let mean = rss.iter().sum::<u64>() as f64 / rss.len() as f64;
+    // f64 accumulation: u64 byte-count sums would wrap long before they
+    // trouble a float.
+    let mean = rss.iter().map(|value| *value as f64).sum::<f64>() / rss.len() as f64;
     let variance = rss
         .iter()
         .map(|value| (*value as f64 - mean).powi(2))
         .sum::<f64>()
         / rss.len() as f64;
     let stability = (1.0 - variance.sqrt() / mean).clamp(0.0, 1.0);
-    let coverage = (rss.len() as f64 / 10.0).min(1.0);
+    let coverage =
+        (rss.len() as f64 / 10.0).min(1.0) * (input.duration.as_secs_f64() / 60.0).min(1.0);
 
     let score = (100.0 * growth * (0.5 * monotonicity + 0.3 * stability + 0.2 * coverage))
         .round()
@@ -181,6 +192,31 @@ mod tests {
             noisy_score < steady_score,
             "noisy {noisy_score} vs steady {steady_score}"
         );
+    }
+
+    #[test]
+    fn short_bursts_cannot_score_severe() {
+        // Same steep climb as the severe fixture, but over 9 seconds:
+        // duration trust caps coverage, so this lands in Likely at best.
+        let rss: Vec<u64> = (0..10).map(|i| 100 + i * 10).collect();
+        let score = leak_score(LeakScoreInput {
+            rss: &rss,
+            duration: Duration::from_secs(9),
+            min_size_bytes: 0,
+        });
+        assert!(score.score < 75, "score {}", score.score);
+        assert!(score.score >= 50, "score {}", score.score);
+    }
+
+    #[test]
+    fn large_stable_processes_score_zero() {
+        let rss = vec![100 * 1024 * 1024; 30];
+        let score = leak_score(LeakScoreInput {
+            rss: &rss,
+            duration: Duration::from_secs(300),
+            min_size_bytes: 10 * 1024 * 1024,
+        });
+        assert_eq!(score.score, 0);
     }
 
     #[test]
