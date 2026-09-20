@@ -7,6 +7,11 @@
 
 **ramwise** is a terminal-based RAM usage visualizer that goes beyond basic memory monitoring. It provides deep memory introspection, intelligent leak detection, and beautiful visualization all in a lightweight TUI application.
 
+> **Unreleased roadmap surface.** This README documents the complete CLI
+> across the open roadmap PRs (#33–#50); features land progressively as
+> those merge. Anything already on `main` works today; the rest is marked
+> by its PR and verified against that branch (see CHANGELOG).
+
 ## Features
 
 - **Deep Memory Introspection** - See RSS, PSS, USS, shared/private breakdown per process
@@ -30,7 +35,7 @@ integrations and export formats. It uses wall-clock Unix milliseconds,
 explicit byte/count units, collector metadata, and capability markers.
 Runtime-only monotonic `Instant` values are intentionally not serialized;
 unavailable features remain explicit in the exported capability map
-(`swap_rates`, `pressure`, `smaps_rollup`, `regions`).
+(`processes`, `smaps_rollup`, `regions`, `swap_rates`, `pressure`).
 
 ```bash
 # One JSON snapshot to stdout (pipes and scripts)
@@ -132,7 +137,7 @@ The trailing `io` segment appears only once swap-activity rates are known
 ```ini
 # Waybar (custom module, polling every 5s)
 "custom/ramwise": {
-    "exec": "ramwise --tiny --once",
+    "exec": "ramwise --tiny",
     "interval": 5,
     "format": "{}"
 }
@@ -141,14 +146,14 @@ The trailing `io` segment appears only once swap-activity rates are known
 ```tmux
 # tmux status-right (polling every 5s)
 set -g status-interval 5
-set -g status-right "#(ramwise --tiny --once)"
+set -g status-right "#(ramwise --tiny)"
 ```
 
 ```ini
 # Polybar (custom script module)
 [module/ramwise]
 type = custom/script
-exec = ramwise --tiny --once
+exec = ramwise --tiny
 interval = 5
 ```
 
@@ -225,7 +230,9 @@ gap and normal monitoring is unaffected.
 ## Capability limits and accounting
 
 - Unavailable metrics are omitted, never zeroed: no smaps means no
-  PSS/USS segments; no swap configured prints "not configured".
+  PSS/USS segments; machines without swap say "not configured" in the
+  accounting notes (the `--tiny` line still prints its fixed `swap 0B/0B`
+  segment, and the header drops the swap segment instead).
 - Page cache is reclaimable and counts as available — it is not pressure
   and not a leak. Slab is mostly unreclaimable kernel memory. `shmem`/tmpfs
   is counted in processes too. Summed process RSS overcounts shared memory;
@@ -344,7 +351,7 @@ ramwise/
 
 ## Requirements
 
-- Linux kernel 2.6.28+ (for `/proc/[pid]/smaps_rollup`)
+- Linux kernel 4.14+ (for `/proc/[pid]/smaps_rollup`), 5.8+ for native eBPF ring buffers
 - Terminal with color support
 
 ## Contributing

@@ -2,7 +2,10 @@
 
 ## Unreleased
 
-Documents the roadmap tracked in issues #10–#27:
+Documents the roadmap tracked in issues #10–#27 (closed #25 shipped
+deterministic collector/analyzer/UI coverage first):
+
+- Deterministic test coverage for collector, analyzer and UI (#25)
 
 - Swap-rate and pressure inputs with explicit capability gaps (#10)
 - Non-interactive CLI: `--once`, `--tiny`, `--watch` (#11)
