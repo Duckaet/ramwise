@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::analyzer::{Insight, Severity};
+use crate::collector::SystemMemory;
 use crate::ui::Theme;
 
 /// Modern insights panel widget
@@ -16,6 +17,7 @@ pub struct InsightsPanelWidget<'a> {
     insights: Vec<&'a Insight>,
     theme: &'a Theme,
     focused: bool,
+    system: Option<&'a SystemMemory>,
 }
 
 impl<'a> InsightsPanelWidget<'a> {
@@ -24,11 +26,18 @@ impl<'a> InsightsPanelWidget<'a> {
             insights,
             theme,
             focused: false,
+            system: None,
         }
     }
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// Show the memory-pressure summary line above the insights.
+    pub fn pressure(mut self, system: &'a SystemMemory) -> Self {
+        self.system = Some(system);
         self
     }
 }
@@ -107,25 +116,33 @@ impl<'a> Widget for InsightsPanelWidget<'a> {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        // Optional pressure summary reserves the first row so the level and
+        // the used-versus-available explanation are always visible.
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(system) = self.system {
+            lines.push(pressure_line(system, self.theme));
+        }
+        let reserved = lines.len();
+
         if self.insights.is_empty() {
             // Show success state with icon
-            let lines = vec![Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled("  ✓ ", Style::default().fg(self.theme.success)),
                 Span::styled(
                     "System looks healthy",
                     Style::default().fg(self.theme.fg_dim),
                 ),
-            ])];
+            ]));
             let paragraph = Paragraph::new(lines);
             paragraph.render(inner, buf);
             return;
         }
 
         // Build lines for each insight with modern styling
-        let lines: Vec<Line> = self
+        let insight_lines = self
             .insights
             .iter()
-            .take(inner.height as usize)
+            .take((inner.height as usize).saturating_sub(reserved))
             .map(|insight| {
                 // Severity icon with color
                 let (icon, icon_style) = match insight.severity {
@@ -176,11 +193,32 @@ impl<'a> Widget for InsightsPanelWidget<'a> {
                     Span::styled(format!(" {}", suggestion), self.theme.muted_style()),
                 ])
             })
-            .collect();
+            .collect::<Vec<Line>>();
+        lines.extend(insight_lines);
 
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         paragraph.render(inner, buf);
     }
+}
+
+/// First-row pressure summary: level plus used-versus-available explanation.
+fn pressure_line(system: &SystemMemory, theme: &Theme) -> Line<'static> {
+    use crate::analyzer::{PressureLevel, PressureThresholds, classify, explain};
+    let level = classify(system, &PressureThresholds::default());
+    let color = match level {
+        PressureLevel::Unknown => theme.fg_dim,
+        PressureLevel::Normal => theme.success,
+        PressureLevel::Elevated => theme.warning,
+        PressureLevel::Critical => theme.error,
+    };
+    Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(color)),
+        Span::styled(
+            format!("Pressure {} — ", level.label()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(explain(system, level), Style::default().fg(theme.fg_dim)),
+    ])
 }
 
 fn count_by_severity(insights: &[&Insight]) -> (usize, usize, usize) {

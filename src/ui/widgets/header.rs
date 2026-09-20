@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::analyzer::{PressureLevel, PressureThresholds, classify};
 use crate::collector::SystemMemory;
 use crate::ui::Theme;
 use crate::utils::format_bytes;
@@ -121,10 +122,20 @@ impl<'a> Widget for HeaderWidget<'a> {
             Span::styled(" Quit ", self.theme.muted_style()),
         ];
 
-        // Combine all parts
+        // Combine all parts. Narrow terminals degrade gracefully: below 70
+        // cells the swap segment is dropped but the pressure level survives;
+        // below 40 cells only title plus level remain.
+        let level = classify(sys, &PressureThresholds::default());
         let mut spans = vec![title, dot.clone()];
-        spans.extend(ram);
-        spans.extend(swap);
+        if area.width >= 40 {
+            spans.extend(ram);
+            if area.width >= 70 {
+                spans.extend(swap);
+            }
+            spans.extend(pressure_spans(level, self.theme));
+        } else {
+            spans.push(pressure_glyph(level, self.theme));
+        }
 
         // Calculate padding for right alignment
         let content_width: usize = spans.iter().map(|s| s.width()).sum();
@@ -159,4 +170,92 @@ fn create_sleek_bar(percent: f64, width: usize) -> String {
     bar.push_str(&"░".repeat(remaining));
 
     bar
+}
+
+/// Color for a pressure level; unknown renders dim so absence of data is
+/// visible rather than silently green.
+fn level_color(level: PressureLevel, theme: &Theme) -> ratatui::style::Color {
+    match level {
+        PressureLevel::Unknown => theme.fg_dim,
+        PressureLevel::Normal => theme.success,
+        PressureLevel::Elevated => theme.warning,
+        PressureLevel::Critical => theme.error,
+    }
+}
+
+/// Full pressure segment: separator, label, colored glyph, level name.
+fn pressure_spans(level: PressureLevel, theme: &Theme) -> Vec<Span<'static>> {
+    let color = level_color(level, theme);
+    vec![
+        Span::styled(" · ", theme.muted_style()),
+        Span::styled("Pressure ", Style::default().fg(theme.fg_dim)),
+        pressure_glyph(level, theme),
+        Span::styled(
+            format!(" {}", level.label()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
+/// Single-cell glyph for very narrow terminals.
+fn pressure_glyph(level: PressureLevel, theme: &Theme) -> Span<'static> {
+    let color = level_color(level, theme);
+    let glyph = match level {
+        PressureLevel::Unknown => "?",
+        _ => "●",
+    };
+    Span::styled(
+        glyph,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+    use crate::ui::Theme;
+
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn header_renders_pressure_level_at_full_width() {
+        let theme = Theme::dark();
+        let system = test_support::system_memory();
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        HeaderWidget::new(&system, &theme).render(area, &mut buf);
+        let text = buffer_text(&buf);
+        assert!(text.contains("RAM"));
+        assert!(text.contains("stable"));
+    }
+
+    #[test]
+    fn header_survives_narrow_terminals() {
+        let theme = Theme::dark();
+        let system = test_support::system_memory();
+        for width in [20, 39, 40, 69, 70] {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = Buffer::empty(area);
+            HeaderWidget::new(&system, &theme).render(area, &mut buf);
+            let text = buffer_text(&buf);
+            assert!(text.contains("ramwise"), "width {width}: {text}");
+        }
+        let tiny = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(tiny);
+        HeaderWidget::new(&system, &theme).render(tiny, &mut buf);
+        assert!(buffer_text(&buf).contains('●'));
+    }
+
+    #[test]
+    fn header_marks_unknown_pressure_explicitly() {
+        let theme = Theme::dark();
+        let system = SystemMemory::default();
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        HeaderWidget::new(&system, &theme).render(area, &mut buf);
+        assert!(buffer_text(&buf).contains("unknown"));
+    }
 }
