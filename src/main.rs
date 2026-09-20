@@ -6,6 +6,7 @@
 mod analyzer;
 mod app;
 mod collector;
+mod external_tools;
 mod history;
 mod process_control;
 mod ui;
@@ -197,6 +198,11 @@ async fn run_app(
                 render_kill_confirm_overlay(frame, app);
             }
 
+            // External-tool confirmation overlay
+            if app.pending_tool.is_some() {
+                render_tool_confirm_overlay(frame, app);
+            }
+
             if let Some(status) = app.action_status.as_ref() {
                 render_action_status(frame, &app.theme, status);
             }
@@ -221,6 +227,23 @@ async fn run_app(
 
         if app.should_quit {
             break;
+        }
+
+        // Effect pump: a confirmed external tool suspends the TUI, runs
+        // with the real terminal, then resumes. Failures report through
+        // the standard status mechanism once we are back.
+        if let Some((tool, spec)) = app.pending_spawn.take() {
+            disable_raw_mode().context("Failed to suspend terminal mode")?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                .context("Failed to leave alternate screen")?;
+            let result = external_tools::run_interactive(&spec);
+            execute!(terminal.backend_mut(), EnterAlternateScreen)
+                .context("Failed to re-enter alternate screen")?;
+            enable_raw_mode().context("Failed to resume terminal mode")?;
+            terminal
+                .clear()
+                .context("Failed to redraw after tool exit")?;
+            app.complete_spawn(tool, result);
         }
     }
 
@@ -253,6 +276,9 @@ fn render_help_overlay(frame: &mut ratatui::Frame, theme: &ui::Theme) {
     s            Cycle sort mode
     g            Go to top
     G            Go to bottom
+    H            Inspect selected process in htop
+    R            Trace selected process syscalls (strace)
+    V            Relaunch selected binary under valgrind
     x            Send SIGTERM
     X            Confirm + send SIGKILL
 
@@ -302,6 +328,38 @@ fn render_kill_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let paragraph = Paragraph::new(message).alignment(Alignment::Center).block(
         Block::default()
             .title(" Confirm Kill ")
+            .borders(Borders::ALL)
+            .border_style(app.theme.border_style(true))
+            .style(app.theme.base_style()),
+    );
+
+    frame.render_widget(paragraph, modal_area);
+}
+
+fn render_tool_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
+    let area = frame.area();
+    let width = 70.min(area.width.saturating_sub(4));
+    let height = 7.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let label = match &app.pending_tool {
+        Some((tool, spec)) => format!("{} {}?", tool.label(), external_tools::describe(spec)),
+        None => "No tool selected".to_string(),
+    };
+
+    let message = vec![
+        Line::from(Span::styled(label, Style::default().fg(app.theme.warning))),
+        Line::from(""),
+        Line::from("Press Enter to run, Esc to cancel"),
+    ];
+
+    let paragraph = Paragraph::new(message).alignment(Alignment::Center).block(
+        Block::default()
+            .title(" Confirm Tool ")
             .borders(Borders::ALL)
             .border_style(app.theme.border_style(true))
             .style(app.theme.base_style()),
