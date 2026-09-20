@@ -80,6 +80,26 @@ struct Args {
     /// clean interrupt, non-zero when collection fails)
     #[arg(long, requires = "tiny")]
     watch: bool,
+
+    /// Write one versioned JSON snapshot to PATH (`-` for stdout).
+    /// Implies a single collection like --once; refuses to overwrite
+    /// existing files unless --force is given.
+    #[arg(long, value_name = "PATH", conflicts_with = "watch")]
+    export_json: Option<std::path::PathBuf>,
+
+    /// Write one CSV snapshot to PATH (`-` for stdout) with the same
+    /// single-collection and overwrite semantics as --export-json.
+    #[arg(long, value_name = "PATH", conflicts_with = "watch")]
+    export_csv: Option<std::path::PathBuf>,
+
+    /// Allow exports to overwrite existing files.
+    #[arg(long)]
+    force: bool,
+
+    /// Include expensive region details in exports (adds a regions_json
+    /// column to CSV).
+    #[arg(long)]
+    export_details: bool,
 }
 
 /// How the process executes. Only [`ExecutionMode::Tui`] may initialize the
@@ -111,6 +131,49 @@ fn build_collector(args: &Args) -> Collector {
         .with_interval(Duration::from_millis(args.interval))
         .with_min_rss(args.min_rss * 1024 * 1024)
         .with_smaps(!args.no_smaps)
+}
+
+/// File exports requested on the command line. Any export implies a single
+/// collection like `--once`; `--tiny` additionally prints the status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedExports {
+    json: Option<std::path::PathBuf>,
+    csv: Option<std::path::PathBuf>,
+    force: bool,
+    details: bool,
+}
+
+fn requested_exports(args: &Args) -> Option<RequestedExports> {
+    if args.export_json.is_none() && args.export_csv.is_none() {
+        return None;
+    }
+    Some(RequestedExports {
+        json: args.export_json.clone(),
+        csv: args.export_csv.clone(),
+        force: args.force,
+        details: args.export_details,
+    })
+}
+
+/// Write every requested export. File confirmations go to stderr so stdout
+/// stays pure data when a `-` target is used.
+fn run_exports(snapshot: &collector::MemorySnapshot, exports: &RequestedExports) -> Result<()> {
+    let export = snapshot.to_export();
+    if let Some(path) = &exports.json {
+        let text = collector::render_json(&export)?;
+        collector::write_target(path, &text, exports.force)?;
+        if path.as_os_str() != "-" {
+            eprintln!("exported JSON snapshot to {}", path.display());
+        }
+    }
+    if let Some(path) = &exports.csv {
+        let text = collector::render_csv(&export, exports.details)?;
+        collector::write_target(path, &text, exports.force)?;
+        if path.as_os_str() != "-" {
+            eprintln!("exported CSV snapshot to {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one snapshot to the versioned export contract for `--once`.
@@ -153,17 +216,26 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    match execution_mode(&args) {
-        ExecutionMode::Tui => run_tui(&args).await,
+    let mode = execution_mode(&args);
+    let exports = requested_exports(&args);
+    if mode == ExecutionMode::Tui && exports.is_none() {
+        return run_tui(&args).await;
+    }
+    // Single-shot data path. Requesting an export implies one collection
+    // like --once; --tiny additionally prints the status line.
+    let mut collector = build_collector(&args);
+    let snapshot = collector.collect_snapshot()?;
+    if let Some(exports) = &exports {
+        run_exports(&snapshot, exports)?;
+    }
+    match mode {
+        ExecutionMode::Tui => Ok(()),
         ExecutionMode::Once => {
-            let mut collector = build_collector(&args);
-            let snapshot = collector.collect_snapshot()?;
+            // Explicit --once always prints; bare --export-* writes files only.
             println!("{}", snapshot_to_json(&snapshot)?);
             Ok(())
         }
         ExecutionMode::TinyOnce => {
-            let mut collector = build_collector(&args);
-            let snapshot = collector.collect_snapshot()?;
             println!("{}", render_tiny_line(&snapshot.system));
             Ok(())
         }
@@ -471,6 +543,10 @@ mod tests {
             tiny,
             once,
             watch,
+            export_json: None,
+            export_csv: None,
+            force: false,
+            export_details: false,
         }
     }
 
@@ -543,5 +619,24 @@ mod tests {
         assert!(value["schema_version"].is_number());
         assert!(value["system"]["total_bytes"].is_number());
         assert!(value["processes"].is_array());
+    }
+
+    #[test]
+    fn export_request_mapping_is_explicit() {
+        assert_eq!(requested_exports(&args_with(false, false, false)), None);
+        let mut args = args_with(false, true, false);
+        args.export_json = Some(std::path::PathBuf::from("snap.json"));
+        args.export_csv = Some(std::path::PathBuf::from("-"));
+        args.force = true;
+        args.export_details = true;
+        assert_eq!(
+            requested_exports(&args),
+            Some(RequestedExports {
+                json: Some(std::path::PathBuf::from("snap.json")),
+                csv: Some(std::path::PathBuf::from("-")),
+                force: true,
+                details: true,
+            })
+        );
     }
 }
