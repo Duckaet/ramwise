@@ -6,6 +6,7 @@
 mod export;
 mod procfs_collector;
 mod types;
+mod writers;
 
 #[allow(unused_imports)]
 pub use export::{
@@ -14,3 +15,4 @@ pub use export::{
 };
 pub use procfs_collector::Collector;
 pub use types::{MemorySnapshot, ProcessMemory, SystemMemory};
+pub use writers::{render_csv, render_json, write_target};
