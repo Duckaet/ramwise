@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::collector::{ExportProcessMemory, ExportSnapshot, SNAPSHOT_SCHEMA_VERSION};
+use crate::collector::{ExportProcessMemory, ExportSnapshot};
 
 /// Comparison failures are explicit: callers (and exit codes) distinguish
 /// an unreadable input from an incompatible contract.
@@ -95,8 +95,14 @@ pub fn compare_snapshots(
     }
 
     let mut warnings = Vec::new();
-    let old_index = index_processes(&old.processes);
-    let new_index = index_processes(&new.processes);
+    let (old_index, old_duplicates) = index_processes(&old.processes);
+    let (new_index, new_duplicates) = index_processes(&new.processes);
+    for duplicate in old_duplicates.iter().chain(&new_duplicates) {
+        warnings.push(format!(
+            "duplicate identity (pid {}, start {}) kept first occurrence",
+            duplicate.0, duplicate.1
+        ));
+    }
     let mut added = Vec::new();
     let mut removed = Vec::new();
     let mut changed = Vec::new();
@@ -106,26 +112,59 @@ pub fn compare_snapshots(
 
     for key in old_keys.difference(&new_keys) {
         let old_process = &old_index[key];
-        // Same PID, different start time on the new side means the PID was
-        // reused: report removal plus addition, never a silent match.
-        if new
-            .processes
-            .iter()
-            .any(|p| p.pid == key.0 && p.start_time_ticks != key.1)
-        {
-            warnings.push(format!(
-                "pid {} reused (start time changed); reported as removed plus added",
-                key.0
-            ));
-            removed.push(process_ref(old_process));
-            continue;
+        // Same PID with a different KNOWN start time on the new side means
+        // the PID was reused: removal plus addition, never a silent match.
+        // When either side is zero (unknown, e.g. pre-start-time files),
+        // identity falls back to PID-only with an explicit warning instead.
+        let counterpart = new.processes.iter().find(|p| p.pid == key.0);
+        match counterpart {
+            Some(other)
+                if key.1 != 0 && other.start_time_ticks != 0 && other.start_time_ticks != key.1 =>
+            {
+                warnings.push(format!(
+                    "pid {} reused (start time changed); reported as removed plus added",
+                    key.0
+                ));
+                removed.push(process_ref(old_process));
+            }
+            Some(_) if key.1 == 0 || counterpart.map(|p| p.start_time_ticks) == Some(0) => {
+                warnings.push(format!(
+                    "pid {} matched by PID only (start time unknown on a side)",
+                    key.0
+                ));
+                let other = counterpart.expect("PID-only fallback found its counterpart");
+                let delta = ProcessDelta {
+                    pid: key.0,
+                    name: other.name.clone(),
+                    rss_delta_bytes: delta_bytes(other.rss_bytes, old_process.rss_bytes),
+                    pss_delta_bytes: delta_bytes(other.pss_bytes, old_process.pss_bytes),
+                    private_delta_bytes: delta_bytes(
+                        other.private_bytes,
+                        old_process.private_bytes,
+                    ),
+                    swap_delta_bytes: delta_bytes(other.swap_bytes, old_process.swap_bytes),
+                };
+                if delta.rss_delta_bytes != 0
+                    && delta.rss_delta_bytes.unsigned_abs() >= options.min_delta_bytes
+                {
+                    changed.push(delta);
+                }
+            }
+            _ => {
+                removed.push(process_ref(old_process));
+            }
         }
-        removed.push(process_ref(old_process));
     }
     for key in new_keys.difference(&old_keys) {
         // The removal side above already records reuse pairs, but the
-        // addition side is still needed for a complete picture.
-        added.push(process_ref(new_index[key]));
+        // addition side is still needed for a complete picture. Pairs
+        // already emitted as PID-only fallback matches are skipped here.
+        let already_matched = old.processes.iter().any(|p| {
+            p.pid == key.0 && (p.start_time_ticks == 0 || key.1 == 0) && !old_keys.contains(key)
+        });
+        if !already_matched {
+            added.push(process_ref(new_index[key]));
+        }
     }
     for key in old_keys.intersection(&new_keys) {
         let old_process = &old_index[key];
@@ -139,11 +178,10 @@ pub fn compare_snapshots(
         let delta = ProcessDelta {
             pid: key.0,
             name: new_process.name.clone(),
-            rss_delta_bytes: new_process.rss_bytes as i64 - old_process.rss_bytes as i64,
-            pss_delta_bytes: new_process.pss_bytes as i64 - old_process.pss_bytes as i64,
-            private_delta_bytes: new_process.private_bytes as i64
-                - old_process.private_bytes as i64,
-            swap_delta_bytes: new_process.swap_bytes as i64 - old_process.swap_bytes as i64,
+            rss_delta_bytes: delta_bytes(new_process.rss_bytes, old_process.rss_bytes),
+            pss_delta_bytes: delta_bytes(new_process.pss_bytes, old_process.pss_bytes),
+            private_delta_bytes: delta_bytes(new_process.private_bytes, old_process.private_bytes),
+            swap_delta_bytes: delta_bytes(new_process.swap_bytes, old_process.swap_bytes),
         };
         if delta.rss_delta_bytes != 0
             && delta.rss_delta_bytes.unsigned_abs() >= options.min_delta_bytes
@@ -154,20 +192,26 @@ pub fn compare_snapshots(
 
     added.sort_by_key(|entry: &ProcessRef| entry.pid);
     removed.sort_by_key(|entry: &ProcessRef| entry.pid);
-    changed.sort_by_key(|delta: &ProcessDelta| std::cmp::Reverse(delta.rss_delta_bytes.abs()));
+    changed.sort_by_key(|delta: &ProcessDelta| {
+        std::cmp::Reverse(delta.rss_delta_bytes.unsigned_abs())
+    });
     warnings.sort();
     warnings.dedup();
 
     Ok(SnapshotDiff {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        schema_version: new.schema_version,
         from_captured_at_unix_ms: old.captured_at_unix_ms,
         to_captured_at_unix_ms: new.captured_at_unix_ms,
         system: SystemDelta {
-            total_delta_bytes: new.system.total_bytes as i64 - old.system.total_bytes as i64,
-            available_delta_bytes: new.system.available_bytes as i64
-                - old.system.available_bytes as i64,
-            swap_used_delta_bytes: new.system.swap_used_bytes as i64
-                - old.system.swap_used_bytes as i64,
+            total_delta_bytes: delta_bytes(new.system.total_bytes, old.system.total_bytes),
+            available_delta_bytes: delta_bytes(
+                new.system.available_bytes,
+                old.system.available_bytes,
+            ),
+            swap_used_delta_bytes: delta_bytes(
+                new.system.swap_used_bytes,
+                old.system.swap_used_bytes,
+            ),
         },
         added,
         removed,
@@ -176,13 +220,29 @@ pub fn compare_snapshots(
     })
 }
 
+/// Signed byte delta computed via i128 so large counters can never wrap.
+fn delta_bytes(new: u64, old: u64) -> i64 {
+    (new as i128 - old as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 type ProcessIndex<'a> = BTreeMap<(i32, u64), &'a ExportProcessMemory>;
 
-fn index_processes(processes: &[ExportProcessMemory]) -> ProcessIndex<'_> {
-    processes
-        .iter()
-        .map(|process| ((process.pid, process.start_time_ticks), process))
-        .collect()
+/// Index by identity, reporting duplicate keys. First occurrence wins;
+/// callers surface the duplicates as warnings.
+fn index_processes(processes: &[ExportProcessMemory]) -> (ProcessIndex<'_>, Vec<(i32, u64)>) {
+    use std::collections::btree_map::Entry;
+    let mut index = ProcessIndex::new();
+    let mut duplicates = Vec::new();
+    for process in processes {
+        let key = (process.pid, process.start_time_ticks);
+        match index.entry(key) {
+            Entry::Occupied(_) => duplicates.push(key),
+            Entry::Vacant(slot) => {
+                slot.insert(process);
+            }
+        }
+    }
+    (index, duplicates)
 }
 
 /// Load one exported snapshot file, validating its schema version.
@@ -193,7 +253,7 @@ pub fn load_snapshot(path: &Path) -> Result<ExportSnapshot> {
         .with_context(|| format!("failed to parse {} as a snapshot", path.display()))?;
     snapshot
         .validate()
-        .map_err(|message| anyhow::anyhow!("{message}"))?;
+        .map_err(|message| anyhow::anyhow!("{}: {message}", path.display()))?;
     Ok(snapshot)
 }
 
@@ -214,10 +274,10 @@ pub fn render_human(diff: &SnapshotDiff) -> String {
         out.push_str("no changes\n");
     }
     for entry in &diff.added {
-        writeln!(out, "+ pid {} {} (new)", entry.pid, entry.name).unwrap();
+        writeln!(out, "+ pid {} {} (new)", entry.pid, safe_name(&entry.name)).unwrap();
     }
     for entry in &diff.removed {
-        writeln!(out, "- pid {} {} (gone)", entry.pid, entry.name).unwrap();
+        writeln!(out, "- pid {} {} (gone)", entry.pid, safe_name(&entry.name)).unwrap();
     }
     const MAX_CHANGED_LINES: usize = 10;
     for delta in diff.changed.iter().take(MAX_CHANGED_LINES) {
@@ -225,7 +285,7 @@ pub fn render_human(diff: &SnapshotDiff) -> String {
             out,
             "~ pid {} {} rss {:+} pss {:+}",
             delta.pid,
-            delta.name,
+            safe_name(&delta.name),
             format_bytes_signed(delta.rss_delta_bytes),
             format_bytes_signed(delta.pss_delta_bytes),
         )
@@ -254,7 +314,9 @@ pub fn render_json(diff: &SnapshotDiff) -> Result<String> {
     serde_json::to_string(diff).context("Failed to serialize diff to JSON")
 }
 
-/// CSV diff: stable changed-process table with a metadata comment.
+/// CSV diff: the changed-process table only (stable header plus a metadata
+/// comment). Added, removed and system movement live in the human and JSON
+/// renders; CSV stays a machine-readable mover list by design.
 pub fn render_csv(diff: &SnapshotDiff) -> String {
     let mut out = String::new();
     writeln!(out, "# ramwise-diff schema_version={}", diff.schema_version).unwrap();
@@ -280,11 +342,19 @@ pub fn render_csv(diff: &SnapshotDiff) -> String {
 }
 
 fn csv_field(field: &str) -> String {
-    if field.contains([',', '"', '\n']) {
+    if field.contains([',', '"', '\r', '\n']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
     }
+}
+
+/// Names render inside line-oriented output, so control characters that
+/// could forge lines are replaced before printing.
+fn safe_name(name: &str) -> String {
+    name.chars()
+        .map(|cell| if cell.is_control() { '?' } else { cell })
+        .collect()
 }
 
 #[cfg(test)]
@@ -378,11 +448,63 @@ mod tests {
     }
 
     #[test]
-    fn unknown_start_times_warn_about_pid_only_matching() {
-        let (old, new) = snapshots(vec![process(7, 0, 100)], vec![process(7, 0, 150)]);
+    fn unknown_start_on_one_side_falls_back_to_pid() {
+        // Old file predates start times: same PID matches by PID with a
+        // warning instead of reporting remove-plus-add.
+        let (old, new) = snapshots(vec![process(7, 0, 100)], vec![process(7, 99, 150)]);
         let diff = compare_snapshots(&old, &new, CompareOptions::default()).unwrap();
+        assert!(diff.removed.is_empty());
+        assert!(diff.added.is_empty());
         assert_eq!(diff.changed.len(), 1);
+        assert_eq!(diff.changed[0].rss_delta_bytes, 50);
         assert!(diff.warnings.iter().any(|w| w.contains("PID only")));
+    }
+
+    #[test]
+    fn duplicate_identities_warn_and_keep_first() {
+        let (old, new) = snapshots(
+            vec![process(7, 10, 100), process(7, 10, 999)],
+            vec![process(7, 10, 100)],
+        );
+        let diff = compare_snapshots(&old, &new, CompareOptions::default()).unwrap();
+        assert!(diff.warnings.iter().any(|w| w.contains("duplicate")));
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn negative_deltas_order_by_absolute_movement() {
+        let (old, new) = snapshots(
+            vec![process(1, 10, 1000), process(2, 20, 1000)],
+            vec![process(1, 10, 900), process(2, 20, 500)],
+        );
+        let diff = compare_snapshots(&old, &new, CompareOptions::default()).unwrap();
+        assert_eq!(diff.changed.len(), 2);
+        assert_eq!(diff.changed[0].pid, 2);
+        assert_eq!(diff.changed[0].rss_delta_bytes, -500);
+        assert_eq!(diff.changed[1].rss_delta_bytes, -100);
+    }
+
+    #[test]
+    fn csv_quotes_names_with_commas() {
+        let (old, new) = snapshots(
+            vec![process(1, 10, 100)],
+            vec![ExportProcessMemory {
+                name: "a,b".into(),
+                rss_bytes: 500,
+                ..process(1, 10, 100)
+            }],
+        );
+        let diff = compare_snapshots(&old, &new, CompareOptions::default()).unwrap();
+        assert!(render_csv(&diff).contains("\"a,b\""));
+        let text = render_human(&diff);
+        assert!(text.contains("a,b"));
+    }
+
+    #[test]
+    fn load_snapshot_reports_paths_on_failure() {
+        let missing = Path::new("/nonexistent-ramwise-fixture/snap.json");
+        let error = load_snapshot(missing).unwrap_err().to_string();
+        assert!(error.contains("snap.json"));
     }
 
     #[test]
