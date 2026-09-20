@@ -66,9 +66,10 @@ pub fn read_vmstat_sample(path: &Path) -> Result<VmstatSample> {
 
 /// Derive per-second rates from two consecutive samples.
 ///
-/// Returns `None` when the interval is zero or negative. A counter that moved
-/// backwards means the baseline is gone (reboot, kexec, namespace recycle or a
-/// wrap), so the current reading is treated as the whole delta.
+/// Returns `None` when the interval is zero or negative, or when either
+/// counter moved backwards. A backwards counter means the baseline is gone
+/// (reboot, kexec, namespace recycle or a wrap): the delta is unknowable,
+/// so unknown is reported rather than fabricating a rate.
 pub fn swap_rates(previous: &TimedSample, current: &TimedSample) -> Option<SwapRates> {
     let elapsed = current
         .at
@@ -77,19 +78,15 @@ pub fn swap_rates(previous: &TimedSample, current: &TimedSample) -> Option<SwapR
     if elapsed <= 0.0 {
         return None;
     }
+    let in_delta = current.sample.pswpin.checked_sub(previous.sample.pswpin)?;
+    let out_delta = current
+        .sample
+        .pswpout
+        .checked_sub(previous.sample.pswpout)?;
     Some(SwapRates {
-        in_per_sec: counter_delta(previous.sample.pswpin, current.sample.pswpin) as f64 / elapsed,
-        out_per_sec: counter_delta(previous.sample.pswpout, current.sample.pswpout) as f64
-            / elapsed,
+        in_per_sec: in_delta as f64 / elapsed,
+        out_per_sec: out_delta as f64 / elapsed,
     })
-}
-
-fn counter_delta(previous: u64, current: u64) -> u64 {
-    if current >= previous {
-        current - previous
-    } else {
-        current
-    }
 }
 
 /// Parse `/proc/pressure/memory`-formatted text (`some`/`full` lines with
@@ -109,7 +106,8 @@ pub fn parse_memory_pressure(text: &str) -> MemoryPressure {
                 "avg300" => 2,
                 _ => continue,
             };
-            avgs[slot] = raw.parse::<f32>().ok();
+            // Reject non-finite values: "inf"/"nan" must not count as data.
+            avgs[slot] = raw.parse::<f32>().ok().filter(|value| value.is_finite());
         }
         match kind {
             "some" => {
@@ -258,7 +256,7 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
     }
 
     #[test]
-    fn reset_counters_use_the_current_reading_as_delta() {
+    fn reset_counters_yield_unknown_not_a_rate() {
         let start = Instant::now();
         let previous = TimedSample {
             sample: VmstatSample {
@@ -274,9 +272,9 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
             },
             at: start + Duration::from_secs(10),
         };
-        let rates = swap_rates(&previous, &current).unwrap();
-        assert!((rates.in_per_sec - 10.0).abs() < f64::EPSILON);
-        assert!((rates.out_per_sec - 20.0).abs() < f64::EPSILON);
+        // The baseline is gone (reboot/recycle/wrap): report unknown
+        // rather than fabricating a rate from the fresh counters.
+        assert_eq!(swap_rates(&previous, &current), None);
     }
 
     #[test]
@@ -305,6 +303,15 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         assert!(partial.some_avg10.is_none());
         assert!(partial.some_avg60.is_some());
         assert!(partial.is_available());
+    }
+
+    #[test]
+    fn non_finite_pressure_values_are_not_data() {
+        let pressure = parse_memory_pressure("some avg10=inf avg60=NaN avg300=0.50 total=9\n");
+        assert!(pressure.some_avg10.is_none());
+        assert!(pressure.some_avg60.is_none());
+        assert!(pressure.some_avg300.is_some());
+        assert!(pressure.is_available());
     }
 
     #[test]
