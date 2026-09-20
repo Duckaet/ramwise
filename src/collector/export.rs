@@ -43,13 +43,20 @@ pub struct ExportSystemMemory {
     pub cached_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
+    /// Added after schema 1 shipped: defaulted on read so older files parse.
+    #[serde(default)]
     pub swap_in_pages: u64,
+    #[serde(default)]
     pub swap_out_pages: u64,
     pub swap_in_rate_per_sec: Option<f64>,
     pub swap_out_rate_per_sec: Option<f64>,
     pub slab_bytes: u64,
+    /// Added after schema 1 shipped: defaulted on read so older files parse.
+    #[serde(default)]
     pub slab_reclaimable_bytes: u64,
+    #[serde(default)]
     pub slab_unreclaimable_bytes: u64,
+    #[serde(default)]
     pub kernel_stack_bytes: u64,
     pub pressure_some_avg10: Option<f32>,
     pub pressure_some_avg60: Option<f32>,
@@ -396,6 +403,30 @@ mod tests {
         assert!(json["system"]["pressure_some_avg10"].is_null());
         assert_eq!(json["capabilities"]["swap_rates"], "unavailable");
         assert_eq!(json["capabilities"]["pressure"], "unavailable");
+    }
+
+    #[test]
+    fn snapshots_predating_new_system_fields_still_parse() {
+        let mut json = serde_json::to_value(ExportSnapshot::fixture()).unwrap();
+        let system = json["system"].as_object_mut().unwrap();
+        for field in [
+            "swap_in_pages",
+            "swap_out_pages",
+            "swap_in_rate_per_sec",
+            "swap_out_rate_per_sec",
+            "slab_reclaimable_bytes",
+            "slab_unreclaimable_bytes",
+            "kernel_stack_bytes",
+            "pressure_some_avg10",
+            "pressure_full_avg300",
+        ] {
+            system.remove(field);
+        }
+        let decoded: ExportSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.system.swap_in_pages, 0);
+        assert_eq!(decoded.system.kernel_stack_bytes, 0);
+        assert_eq!(decoded.system.pressure_full_avg300, None);
+        assert!(decoded.validate().is_ok());
     }
 
     #[test]
