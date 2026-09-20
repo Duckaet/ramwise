@@ -146,15 +146,36 @@ pub struct ExportSnapshot {
 pub type SnapshotExport = ExportSnapshot;
 
 impl ExportSnapshot {
-    /// Reject a payload from a schema version this binary does not understand.
+    /// Reject a payload from a schema version this binary does not understand,
+    /// or one carrying non-finite floats (rates and pressure must be real
+    /// numbers or explicit nulls, never NaN or infinity).
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version == SNAPSHOT_SCHEMA_VERSION {
-            Ok(())
-        } else {
-            Err(format!(
+        if self.schema_version != SNAPSHOT_SCHEMA_VERSION {
+            return Err(format!(
                 "unsupported snapshot schema version {}",
                 self.schema_version
-            ))
+            ));
+        }
+        let system = &self.system;
+        let finite = [system.swap_in_rate_per_sec, system.swap_out_rate_per_sec]
+            .into_iter()
+            .flatten()
+            .all(f64::is_finite);
+        let pressures = [
+            system.pressure_some_avg10,
+            system.pressure_some_avg60,
+            system.pressure_some_avg300,
+            system.pressure_full_avg10,
+            system.pressure_full_avg60,
+            system.pressure_full_avg300,
+        ]
+        .into_iter()
+        .flatten()
+        .all(f32::is_finite);
+        if finite && pressures {
+            Ok(())
+        } else {
+            Err("non-finite swap rate or pressure value".to_string())
         }
     }
 
@@ -173,7 +194,7 @@ impl ExportSnapshot {
         if snapshot.processes.iter().any(|p| p.regions.is_some()) {
             capabilities.insert("regions".to_string(), Capability::Available);
         }
-        if snapshot.system.swap_in_rate.is_some() || snapshot.system.swap_out_rate.is_some() {
+        if snapshot.system.swap_in_rate.is_some() && snapshot.system.swap_out_rate.is_some() {
             capabilities.insert("swap_rates".to_string(), Capability::Available);
         }
         if snapshot.system.pressure.is_available() {
@@ -342,6 +363,18 @@ mod tests {
         let mut fixture = ExportSnapshot::fixture();
         fixture.schema_version += 1;
         assert!(fixture.validate().is_err());
+    }
+
+    #[test]
+    fn non_finite_values_are_rejected() {
+        let mut fixture = ExportSnapshot::fixture();
+        fixture.system.swap_in_rate_per_sec = Some(f64::NAN);
+        assert!(fixture.validate().is_err());
+        fixture.system.swap_in_rate_per_sec = Some(1.0);
+        fixture.system.pressure_some_avg10 = Some(f32::INFINITY);
+        assert!(fixture.validate().is_err());
+        fixture.system.pressure_some_avg10 = Some(1.0);
+        assert!(fixture.validate().is_ok());
     }
 
     #[test]
