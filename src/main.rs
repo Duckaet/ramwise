@@ -542,6 +542,8 @@ mod tests {
 
     #[test]
     fn tiny_line_is_pinned_by_a_golden_fixture() {
+        // Pinned against default thresholds: if PressureThresholds changes,
+        // this golden must be consciously re-pinned.
         let line = render_tiny_line(&test_support::system_memory());
         assert_eq!(line, "mem 8.0G/16.0G 50.0% stable swap 512.0M/4.0G");
     }
@@ -556,6 +558,9 @@ mod tests {
             "mem 8.0G/16.0G 50.0% stable swap 512.0M/4.0G io 10.0/20.0pg/s"
         );
         system.swap_in_rate = None;
+        assert!(!render_tiny_line(&system).contains("io "));
+        system.swap_in_rate = Some(10.0);
+        system.swap_out_rate = None;
         assert!(!render_tiny_line(&system).contains("io "));
     }
 
