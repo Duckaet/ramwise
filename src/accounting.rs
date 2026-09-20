@@ -19,28 +19,37 @@ pub struct CompositionSegment {
     pub fraction: f64,
 }
 
-/// Stacked composition of one process: private, shared and swapped memory
-/// as fractions of RSS. Segments with no data are omitted (never zeroed);
-/// an empty RSS yields no segments at all.
+/// Stacked composition of one process: private and shared memory as
+/// fractions of RSS. Swap is deliberately excluded — VmSwap is not resident
+/// and stacking it with RSS fractions sums past 100%. Segments with no data
+/// are omitted (never zeroed); an empty RSS yields no segments at all.
+///
+/// Without smaps detail (`pss == 0 && uss == 0`) the split is unavailable:
+/// a single `rss` segment says so instead of guessing a breakdown.
 pub fn composition_segments(process: &ProcessMemory) -> Vec<CompositionSegment> {
     if process.rss == 0 {
         return Vec::new();
     }
+    if process.pss == 0 && process.uss == 0 {
+        return vec![CompositionSegment {
+            label: "rss",
+            bytes: process.rss,
+            fraction: 1.0,
+        }];
+    }
     let mut segments = Vec::new();
     let mut accounted = 0u64;
-    for (label, bytes) in [
-        ("private", process.private),
-        ("shared", process.shared),
-        ("swap", process.swap),
-    ] {
+    for (label, bytes) in [("private", process.private), ("shared", process.shared)] {
         if bytes == 0 {
             continue;
         }
         accounted = accounted.saturating_add(bytes);
+        // Clamp: inconsistent inputs must not push the total past 1.
+        let fraction = (bytes as f64 / process.rss as f64).min(1.0);
         segments.push(CompositionSegment {
             label,
             bytes,
-            fraction: bytes as f64 / process.rss as f64,
+            fraction,
         });
     }
     let remainder = process.rss.saturating_sub(accounted);
@@ -48,7 +57,7 @@ pub fn composition_segments(process: &ProcessMemory) -> Vec<CompositionSegment> 
         segments.push(CompositionSegment {
             label: "other",
             bytes: remainder,
-            fraction: remainder as f64 / process.rss as f64,
+            fraction: (remainder as f64 / process.rss as f64).min(1.0),
         });
     }
     segments
@@ -129,7 +138,7 @@ mod tests {
     #[test]
     fn composition_covers_rss_without_zero_segments() {
         let process = test_support::process(1000);
-        // Fixture: shared 250, private 750, swap 0 (omitted, not zeroed).
+        // Fixture: shared 250, private 750, swap 0 (swap never stacks).
         let segments = composition_segments(&process);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].label, "private");
@@ -137,6 +146,27 @@ mod tests {
         assert_eq!(segments[1].label, "shared");
         let total: f64 = segments.iter().map(|segment| segment.fraction).sum();
         assert!((total - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn swap_is_not_stacked_into_rss() {
+        let mut process = test_support::process(1000);
+        process.swap = 500;
+        let segments = composition_segments(&process);
+        assert!(segments.iter().all(|segment| segment.label != "swap"));
+        let total: f64 = segments.iter().map(|segment| segment.fraction).sum();
+        assert!(total <= 1.0 + 1e-9);
+    }
+
+    #[test]
+    fn missing_smaps_yields_a_single_rss_segment() {
+        let mut process = test_support::process(1000);
+        process.pss = 0;
+        process.uss = 0;
+        let segments = composition_segments(&process);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].label, "rss");
+        assert_eq!(segments[0].fraction, 1.0);
     }
 
     #[test]

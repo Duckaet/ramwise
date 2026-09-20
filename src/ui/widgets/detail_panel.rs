@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
 use crate::accounting::{composition_segments, system_notes};
@@ -310,7 +310,7 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             ]));
         }
 
-        let paragraph = Paragraph::new(lines);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         paragraph.render(inner, buf);
     }
 }
@@ -408,11 +408,33 @@ fn composition_bar(
 ) -> Vec<Span<'static>> {
     const WIDTH: usize = 24;
     let palette = [theme.primary, theme.secondary, theme.warning, theme.fg_dim];
+    // Largest remainder: floors plus leftover cells to the largest
+    // fractions, so rounded widths sum to exactly WIDTH.
+    let mut widths: Vec<usize> = segments
+        .iter()
+        .map(|segment| (segment.fraction * WIDTH as f64).floor() as usize)
+        .collect();
+    let mut remainder = WIDTH.saturating_sub(widths.iter().sum());
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    order.sort_by(|&a, &b| {
+        let frac = |index: usize| segments[index].fraction * WIDTH as f64 - widths[index] as f64;
+        frac(b)
+            .partial_cmp(&frac(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for index in order {
+        if remainder == 0 {
+            break;
+        }
+        widths[index] += 1;
+        remainder -= 1;
+    }
     let mut spans = vec![Span::styled("  ", Style::default())];
-    for (index, segment) in segments.iter().enumerate() {
-        let width = (segment.fraction * WIDTH as f64).round() as usize;
+    for (index, width) in widths.iter().enumerate() {
+        // No minimum: hairline fractions render as nothing in the bar but
+        // stay listed in the legend below; the row sums to exactly WIDTH.
         spans.push(Span::styled(
-            "█".repeat(width.max(1)),
+            "█".repeat((*width).min(WIDTH)),
             Style::default().fg(palette[index % palette.len()]),
         ));
     }
@@ -474,5 +496,19 @@ mod tests {
             .render(area, &mut buf);
         let text = buffer_text(&buf);
         assert!(text.contains("not configured"));
+    }
+
+    #[test]
+    fn detail_panel_survives_small_areas() {
+        let theme = Theme::dark();
+        let process = test_support::process(100 * 1024 * 1024);
+        let system = test_support::system_memory();
+        for (width, height) in [(20, 8), (30, 12), (60, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            DetailPanelWidget::new(Some(&process), &theme)
+                .system(&system)
+                .render(area, &mut buf);
+        }
     }
 }
