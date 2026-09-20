@@ -86,7 +86,7 @@ pub fn render_csv(snapshot: &ExportSnapshot, include_details: bool) -> Result<St
         let mut row = vec![
             process.pid.to_string(),
             escape_csv(&process.name),
-            process.state.to_string(),
+            escape_csv(&process.state.to_string()),
             process.ppid.to_string(),
             process.uid.to_string(),
             process.rss_bytes.to_string(),
@@ -106,25 +106,24 @@ pub fn render_csv(snapshot: &ExportSnapshot, include_details: bool) -> Result<St
             escape_csv(&process.cmdline),
         ];
         if include_details {
-            let regions = process
-                .regions
-                .as_ref()
-                .map(|regions| serde_json::to_string(regions).unwrap_or_default())
-                .unwrap_or_default();
+            let regions = match &process.regions {
+                Some(regions) => serde_json::to_string(regions).with_context(|| {
+                    format!("failed to serialize regions for pid {}", process.pid)
+                })?,
+                None => String::new(),
+            };
             row.push(escape_csv(&regions));
         }
-        writeln!(out, "{}", row.join(",")).unwrap();
+        writeln!(out, "{}", row.join(",")).expect("writing to a String cannot fail");
     }
     Ok(out)
 }
 
 /// Minimal CSV escaping: quote when the field contains a comma, quote,
-/// or newline, doubling embedded quotes.
+/// carriage return or newline, doubling embedded quotes.
 fn escape_csv(field: &str) -> String {
-    if field.contains([',', '"', '\n']) {
+    if field.contains([',', '"', '\r', '\n']) {
         format!("\"{}\"", field.replace('"', "\"\""))
-    } else if field.is_empty() {
-        String::new()
     } else {
         field.to_string()
     }
@@ -132,23 +131,41 @@ fn escape_csv(field: &str) -> String {
 
 /// Write `contents` to `path`, refusing to overwrite unless `force`.
 /// A path of `-` writes to stdout instead of touching the filesystem.
+///
+/// Overwrite refusal is atomic: without `force` the file is created with
+/// `create_new`, so a pre-existing file (or a symlink planted between a
+/// check and the write) fails instead of being clobbered. With `force`
+/// the file is truncated as requested. Symlinks themselves always resolve
+/// — never point an export at a link you do not trust.
 pub fn write_target(path: &Path, contents: &str, force: bool) -> Result<()> {
     if path.as_os_str() == "-" {
-        io::stdout()
-            .lock()
+        let mut stdout = io::stdout().lock();
+        stdout
             .write_all(contents.as_bytes())
-            .context("Failed to write to stdout")?;
+            .context("failed to write to stdout")?;
+        stdout.flush().context("failed to flush stdout")?;
         return Ok(());
     }
-    if !force && path.exists() {
-        anyhow::bail!("refusing to overwrite existing file {}", path.display());
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        // Atomic: fails when the path already exists, no check-then-act race.
+        options.create_new(true);
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .with_context(|| format!("failed to open {} for writing", path.display()))?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        // create_new failed because the file exists: keep the clear refusal
+        // message instead of leaking the OS error.
+        Err(_) if !force && path.exists() => {
+            anyhow::bail!("refusing to overwrite existing file {}", path.display())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open {} for writing", path.display()));
+        }
+    };
     file.write_all(contents.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
@@ -206,6 +223,15 @@ mod tests {
     }
 
     #[test]
+    fn csv_escapes_carriage_returns_and_state_fields() {
+        assert_eq!(escape_csv("a\rb"), "\"a\rb\"");
+        let mut snapshot = snapshot_with_process();
+        snapshot.processes[0].state = ',';
+        let csv = render_csv(&snapshot, false).unwrap();
+        assert!(csv.contains("\",\","));
+    }
+
+    #[test]
     fn details_flag_appends_regions_column_only() {
         let snapshot = snapshot_with_process();
         let plain = render_csv(&snapshot, false).unwrap();
@@ -238,7 +264,7 @@ mod tests {
     #[test]
     fn writer_reports_unwritable_paths_clearly() {
         let path = Path::new("/nonexistent-ramwise-dir/sub/snap.json");
-        let err = write_target(&path, "data", true).unwrap_err();
+        let err = write_target(path, "data", true).unwrap_err();
         assert!(err.to_string().contains("nonexistent-ramwise-dir"));
     }
 }
