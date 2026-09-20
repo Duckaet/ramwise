@@ -91,15 +91,8 @@ impl Collector {
     fn collect_system_memory(&mut self) -> Result<SystemMemory> {
         let meminfo = Meminfo::current().context("Failed to read /proc/meminfo")?;
 
-        let now = Instant::now();
-        let current_vmstat = read_vmstat_sample(&self.vmstat_path)
-            .ok()
-            .map(|sample| TimedSample { sample, at: now });
-        let rates = match (&self.prev_vmstat, &current_vmstat) {
-            (Some(previous), Some(current)) => swap_rates(previous, current),
-            _ => None,
-        };
-        self.prev_vmstat = current_vmstat;
+        let (swap_in_pages, swap_out_pages, swap_in_rate, swap_out_rate) =
+            self.update_swap_tracking(Instant::now());
 
         let pressure = read_memory_pressure(&self.pressure_path).unwrap_or_default();
 
@@ -111,16 +104,10 @@ impl Collector {
             cached: meminfo.cached,
             swap_total: meminfo.swap_total,
             swap_used: meminfo.swap_total.saturating_sub(meminfo.swap_free),
-            swap_in_pages: self
-                .prev_vmstat
-                .map(|timed| timed.sample.pswpin)
-                .unwrap_or(0),
-            swap_out_pages: self
-                .prev_vmstat
-                .map(|timed| timed.sample.pswpout)
-                .unwrap_or(0),
-            swap_in_rate: rates.map(|rates| rates.in_per_sec),
-            swap_out_rate: rates.map(|rates| rates.out_per_sec),
+            swap_in_pages,
+            swap_out_pages,
+            swap_in_rate,
+            swap_out_rate,
             slab: meminfo.slab,
             slab_reclaimable: meminfo.s_reclaimable.unwrap_or(0),
             slab_unreclaimable: meminfo.s_unreclaim.unwrap_or(0),
@@ -133,6 +120,30 @@ impl Collector {
             writeback: meminfo.writeback,
             mapped: meminfo.mapped,
         })
+    }
+
+    /// Advance vmstat tracking: read the current counters, derive rates
+    /// against the previous reading, and store the new baseline.
+    /// Separated from meminfo so tests drive it with fixture paths and
+    /// explicit timestamps, without depending on live /proc/meminfo.
+    fn update_swap_tracking(&mut self, now: Instant) -> (u64, u64, Option<f64>, Option<f64>) {
+        let current = read_vmstat_sample(&self.vmstat_path)
+            .ok()
+            .map(|sample| TimedSample { sample, at: now });
+        let rates = match (&self.prev_vmstat, &current) {
+            (Some(previous), Some(current)) => swap_rates(previous, current),
+            _ => None,
+        };
+        self.prev_vmstat = current;
+        match &self.prev_vmstat {
+            Some(timed) => (
+                timed.sample.pswpin,
+                timed.sample.pswpout,
+                rates.map(|rates| rates.in_per_sec),
+                rates.map(|rates| rates.out_per_sec),
+            ),
+            None => (0, 0, None, None),
+        }
     }
 
     /// Collect memory information for all processes
@@ -289,7 +300,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn fixture_inputs(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn fixture_inputs(test: &str, pswpin: u64, pswpout: u64) -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "ramwise-{}-{}-{}",
             test,
@@ -302,7 +313,7 @@ mod tests {
         let vmstat = dir.join("vmstat");
         let pressure = dir.join("pressure");
         let mut vmstat_file = std::fs::File::create(&vmstat).unwrap();
-        writeln!(vmstat_file, "pswpin 1200\npswpout 3400\n").unwrap();
+        writeln!(vmstat_file, "pswpin {pswpin}\npswpout {pswpout}\n").unwrap();
         let mut pressure_file = std::fs::File::create(&pressure).unwrap();
         writeln!(
             pressure_file,
@@ -310,6 +321,10 @@ mod tests {
         )
         .unwrap();
         (dir, vmstat, pressure)
+    }
+
+    fn cleanup(dir: &PathBuf) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -334,7 +349,7 @@ mod tests {
 
     #[test]
     fn fixture_inputs_flow_into_the_snapshot() {
-        let (_dir, vmstat, pressure) = fixture_inputs("flow");
+        let (dir, vmstat, pressure) = fixture_inputs("flow", 1200, 3400);
         let mut collector = Collector::new();
         collector.vmstat_path = vmstat;
         collector.pressure_path = pressure;
@@ -344,6 +359,27 @@ mod tests {
         assert_eq!(snapshot.system.swap_in_rate, None);
         assert_eq!(snapshot.system.pressure.some_avg10, Some(1.25));
         assert_eq!(snapshot.system.pressure.full_avg300, Some(0.02));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn swap_tracking_computes_rates_without_meminfo() {
+        use std::time::Duration;
+        let (dir, vmstat, _) = fixture_inputs("rates", 1000, 2000);
+        let mut collector = Collector::new();
+        collector.vmstat_path = vmstat.clone();
+        collector.pressure_path = PathBuf::from("/nonexistent-ramwise-fixture/pressure");
+        let start = Instant::now();
+        let (in_pages, out_pages, in_rate, out_rate) = collector.update_swap_tracking(start);
+        assert_eq!((in_pages, out_pages), (1000, 2000));
+        assert_eq!((in_rate, out_rate), (None, None));
+
+        std::fs::write(&vmstat, "pswpin 1100\npswpout 2200\n").unwrap();
+        let (_, _, in_rate, out_rate) =
+            collector.update_swap_tracking(start + Duration::from_secs(10));
+        assert_eq!(in_rate, Some(10.0));
+        assert_eq!(out_rate, Some(20.0));
+        cleanup(&dir);
     }
 
     #[test]
