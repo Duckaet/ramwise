@@ -7,7 +7,9 @@ lands and the checks re-run on `main`.
 Conventions used below:
 
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features`
-  (no new warnings), `cargo test` — always required.
+  (no new warnings), `cargo test` — always required. `cargo test` runs
+  every target, including the `tests/readme_assets.rs` integration suite
+  that keeps README examples honest.
 - "Live" checks run the built binary, never the test harness.
 - Optional integrations (eBPF, VRAM) additionally require
   capability/error/performance coverage: unavailable states print reasons,
@@ -22,7 +24,7 @@ Conventions used below:
 | Pressure classification with boundary/zero-swap/unknown tests; header + insights indicators | #12 / PR #35 |
 | JSON/CSV writers with round-trip, header-stability, overwrite-refusal tests | #13 / PR #36 |
 | Stable tiny contract with golden tests; live `--tiny --once` deterministic | #14 / PR #39 |
-| TUI/process-control stability: no regressions in existing interaction tests | CI on `main` |
+| TUI/process-control stability: existing interaction tests green (`cargo test`, app/widget suites) | CI on `main` |
 | Deterministic tests: full suite passes on a clean checkout | `cargo test` |
 
 Gate 1 passes when PRs #33, #34, #35, #36, #39 are merged and the checks
@@ -47,12 +49,13 @@ the checks above are green on `main`.
 
 | Check | Linked |
 |---|---|
-| Calm mode engages under Critical pressure; alerts honor cooldown/dedup/dry-run | #21 / PR #45 |
+| Calm mode engages under Critical pressure (deterministic via fixture: MemAvailable ≤10% of MemTotal; live via memory load); alerts honor cooldown/dedup/dry-run | #21 / PR #45 |
 | External tools launch without shell interpolation; missing tools explicit | #22 / PR #46 |
 | eBPF boundary: unsupported systems report reasons; lifecycle/buffer tests | #23 / PR #47 |
 | VRAM boundary: mock contract tests; core runs without drivers | #24 / PR #48 |
 | Optional-integration coverage: capability output, error paths and the
-  default-path performance check (no regression in cold-start `--once`) | live runs |
+  default-path performance check — median of 3 cold-start `ramwise --once`
+  runs within 10% of the pre-PR baseline on the same 2+ core machine | live runs |
 
 Gate 3 passes when PRs #45, #46, #47, #48 are merged and the checks above
 are green on `main`.
@@ -60,7 +63,10 @@ are green on `main`.
 ## Capability / error / performance coverage (gates 1–3, integrations)
 
 - Every unavailable input prints its reason (`unknown`, `not configured`,
-  `not on PATH`, backend reasons) — grep the diagnostics for bare zeros.
+  `not on PATH`, backend reasons) — verify with:
+  `ramwise --once | grep -o '"swap_in_rate_per_sec":[^,]*'` → `null`
+  (not `0`) on a first sample, and `--trace-alloc` / `--vram` naming each
+  missing backend.
 - Every failure path exits non-zero with the cause on stderr; verify with
   bad flag combos, missing files, and schema mismatches.
 - `time ramwise --once` before/after each integration PR: no measurable
