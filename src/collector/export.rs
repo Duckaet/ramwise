@@ -80,6 +80,8 @@ pub enum MemoryRegionKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportProcessMemory {
     pub pid: i32,
+    /// Clock ticks since boot; zero means unknown (see process identity).
+    pub start_time_ticks: u64,
     pub name: String,
     /// May contain sensitive command-line arguments; callers should sanitize before sharing.
     pub cmdline: String,
@@ -206,6 +208,7 @@ impl From<&ProcessMemory> for ExportProcessMemory {
     fn from(value: &ProcessMemory) -> Self {
         Self {
             pid: value.pid,
+            start_time_ticks: value.start_time,
             name: value.name.clone(),
             cmdline: value.cmdline.clone(),
             state: value.state,

@@ -6,6 +6,7 @@
 mod analyzer;
 mod app;
 mod collector;
+mod compare;
 mod history;
 mod process_control;
 mod ui;
@@ -100,6 +101,27 @@ struct Args {
     /// column to CSV).
     #[arg(long)]
     export_details: bool,
+
+    /// Compare two exported JSON snapshots and print the diff (standalone:
+    /// runs instead of any mode output).
+    #[arg(long, num_args = 2, value_names = ["OLD", "NEW"])]
+    compare: Option<Vec<std::path::PathBuf>>,
+
+    /// Diff output format for --compare.
+    #[arg(long, value_enum, default_value = "human")]
+    compare_format: CompareFormat,
+
+    /// Only report changed processes moving at least this much RSS (in MB).
+    #[arg(long, default_value = "0")]
+    compare_min_delta_mb: u64,
+}
+
+/// Diff output format for `--compare`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompareFormat {
+    Human,
+    Json,
+    Csv,
 }
 
 /// How the process executes. Only [`ExecutionMode::Tui`] may initialize the
@@ -216,6 +238,15 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    // Snapshot comparison is standalone: it never enters the TUI or the
+    // single-shot collection path.
+    if let Some(paths) = &args.compare {
+        let [old_path, new_path] = paths.as_slice() else {
+            anyhow::bail!("--compare needs exactly two snapshot paths");
+        };
+        return run_compare(old_path, new_path, args.compare_format, &args);
+    }
+
     let mode = execution_mode(&args);
     let exports = requested_exports(&args);
     if mode == ExecutionMode::Tui && exports.is_none() {
@@ -223,7 +254,7 @@ async fn main() -> Result<()> {
     }
     // Single-shot data path. Requesting an export implies one collection
     // like --once; --tiny additionally prints the status line.
-    let mut collector = build_collector(&args);
+    let collector = build_collector(&args);
     let snapshot = collector.collect_snapshot()?;
     if let Some(exports) = &exports {
         run_exports(&snapshot, exports)?;
@@ -243,10 +274,33 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Compare two exported snapshots and print the diff to stdout.
+/// Schema mismatches and unreadable inputs fail non-zero with the cause.
+fn run_compare(
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+    format: CompareFormat,
+    args: &Args,
+) -> Result<()> {
+    let old = compare::load_snapshot(old_path)?;
+    let new = compare::load_snapshot(new_path)?;
+    let options = compare::CompareOptions {
+        min_delta_bytes: args.compare_min_delta_mb.saturating_mul(1024 * 1024),
+    };
+    let diff = compare::compare_snapshots(&old, &new, options)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    match format {
+        CompareFormat::Human => print!("{}", compare::render_human(&diff)),
+        CompareFormat::Json => println!("{}", compare::render_json(&diff)?),
+        CompareFormat::Csv => print!("{}", compare::render_csv(&diff)),
+    }
+    Ok(())
+}
+
 /// Print the tiny line every interval until interrupted. A clean Ctrl-C ends
 /// with exit 0; a collection failure ends non-zero with the cause on stderr.
 async fn run_tiny_watch(args: &Args) -> Result<()> {
-    let mut collector = build_collector(args);
+    let collector = build_collector(args);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
     loop {
         tokio::select! {
@@ -547,6 +601,9 @@ mod tests {
             export_csv: None,
             force: false,
             export_details: false,
+            compare: None,
+            compare_format: CompareFormat::Human,
+            compare_min_delta_mb: 0,
         }
     }
 
@@ -594,12 +651,12 @@ mod tests {
             min_rss: 1_000_000,
             ..args_with(false, true, false)
         };
-        let mut collector = build_collector(&filtered);
+        let collector = build_collector(&filtered);
         let snapshot = collector.collect_snapshot().unwrap();
         assert!(snapshot.processes.is_empty());
 
         let plain = args_with(false, true, false);
-        let mut collector = build_collector(&plain);
+        let collector = build_collector(&plain);
         assert!(collector.collect_snapshot().is_ok());
     }
 

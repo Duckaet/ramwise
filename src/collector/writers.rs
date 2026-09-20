@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn writer_reports_unwritable_paths_clearly() {
         let path = Path::new("/nonexistent-ramwise-dir/sub/snap.json");
-        let err = write_target(&path, "data", true).unwrap_err();
+        let err = write_target(path, "data", true).unwrap_err();
         assert!(err.to_string().contains("nonexistent-ramwise-dir"));
     }
 }
