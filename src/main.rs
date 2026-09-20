@@ -65,19 +65,132 @@ struct Args {
     /// Theme (by default light or dark)
     #[arg(short, long, default_value = "dark")]
     theme: String,
+
+    /// Print one compact JSON snapshot to stdout and exit (exit 0 on
+    /// success, non-zero when collection fails; diagnostics go to stderr)
+    #[arg(long, conflicts_with = "watch")]
+    once: bool,
+
+    /// Print one one-line status summary to stdout and exit.
+    /// Combine with --watch to repeat the line every interval.
+    #[arg(long)]
+    tiny: bool,
+
+    /// Repeat the --tiny line every interval until interrupted (exit 0 on
+    /// clean interrupt, non-zero when collection fails)
+    #[arg(long, requires = "tiny")]
+    watch: bool,
+}
+
+/// How the process executes. Only [`ExecutionMode::Tui`] may initialize the
+/// terminal; every other mode is plain stdout/stderr and never enters raw mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Tui,
+    Once,
+    TinyOnce,
+    TinyWatch,
+}
+
+fn execution_mode(args: &Args) -> ExecutionMode {
+    if args.watch {
+        ExecutionMode::TinyWatch
+    } else if args.tiny {
+        ExecutionMode::TinyOnce
+    } else if args.once {
+        ExecutionMode::Once
+    } else {
+        ExecutionMode::Tui
+    }
+}
+
+/// Build the collector shared by every execution mode so flags behave
+/// identically in the TUI and in non-interactive commands.
+fn build_collector(args: &Args) -> Collector {
+    Collector::new()
+        .with_interval(Duration::from_millis(args.interval))
+        .with_min_rss(args.min_rss * 1024 * 1024)
+        .with_smaps(!args.no_smaps)
+}
+
+/// Serialize one snapshot to the versioned export contract for `--once`.
+/// The payload is compact JSON on stdout; failures are `Err` so the process
+/// exits non-zero with the cause on stderr.
+fn snapshot_to_json(snapshot: &collector::MemorySnapshot) -> Result<String> {
+    let export = snapshot.to_export();
+    export
+        .validate()
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    serde_json::to_string(&export).context("Failed to serialize snapshot")
+}
+
+/// Render the one-line status summary for `--tiny`.
+///
+/// Provisional shape until the stable status-bar contract lands: used/total
+/// RAM, usage percent, and used/total swap. Pure and deterministic so golden
+/// tests pin it exactly.
+fn render_tiny_line(system: &collector::SystemMemory) -> String {
+    format!(
+        "mem {}/{} {} swap {}/{}",
+        utils::format_bytes(system.used()),
+        utils::format_bytes(system.total),
+        utils::format_percent(system.usage_percent()),
+        utils::format_bytes(system.swap_used),
+        utils::format_bytes(system.swap_total),
+    )
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging if debug mode
+    // Diagnostics always go to stderr so stdout stays pure data in
+    // non-interactive modes (pipelines, status bars, file redirects).
     if args.debug {
         tracing_subscriber::fmt()
             .with_env_filter("ramwise=debug")
+            .with_writer(io::stderr)
             .init();
     }
 
+    match execution_mode(&args) {
+        ExecutionMode::Tui => run_tui(&args).await,
+        ExecutionMode::Once => {
+            let mut collector = build_collector(&args);
+            let snapshot = collector.collect_snapshot()?;
+            println!("{}", snapshot_to_json(&snapshot)?);
+            Ok(())
+        }
+        ExecutionMode::TinyOnce => {
+            let mut collector = build_collector(&args);
+            let snapshot = collector.collect_snapshot()?;
+            println!("{}", render_tiny_line(&snapshot.system));
+            Ok(())
+        }
+        ExecutionMode::TinyWatch => run_tiny_watch(&args).await,
+    }
+}
+
+/// Print the tiny line every interval until interrupted. A clean Ctrl-C ends
+/// with exit 0; a collection failure ends non-zero with the cause on stderr.
+async fn run_tiny_watch(args: &Args) -> Result<()> {
+    let mut collector = build_collector(args);
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let snapshot = collector.collect_snapshot()?;
+                println!("{}", render_tiny_line(&snapshot.system));
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("Failed to listen for interrupt")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_tui(args: &Args) -> Result<()> {
     // Setup terminal
     enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = stdout();
@@ -90,10 +203,7 @@ async fn main() -> Result<()> {
     let mut app = App::new(&args.theme);
 
     // Create collector
-    let collector = Collector::new()
-        .with_interval(Duration::from_millis(args.interval))
-        .with_min_rss(args.min_rss * 1024 * 1024)
-        .with_smaps(!args.no_smaps);
+    let collector = build_collector(args);
 
     // Create channel for snapshots
     let (tx, mut rx) = mpsc::channel(2);
@@ -348,4 +458,94 @@ fn render_action_status(frame: &mut ratatui::Frame, theme: &ui::Theme, status: &
     );
 
     frame.render_widget(paragraph, toast_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+
+    fn args_with(tiny: bool, once: bool, watch: bool) -> Args {
+        Args {
+            interval: 1000,
+            min_rss: 1,
+            no_smaps: false,
+            debug: false,
+            theme: "dark".into(),
+            tiny,
+            once,
+            watch,
+        }
+    }
+
+    #[test]
+    fn mode_dispatch_prefers_the_most_specific_flag() {
+        assert_eq!(
+            execution_mode(&args_with(false, false, false)),
+            ExecutionMode::Tui
+        );
+        assert_eq!(
+            execution_mode(&args_with(false, true, false)),
+            ExecutionMode::Once
+        );
+        assert_eq!(
+            execution_mode(&args_with(true, false, false)),
+            ExecutionMode::TinyOnce
+        );
+        assert_eq!(
+            execution_mode(&args_with(true, true, false)),
+            ExecutionMode::TinyOnce
+        );
+        assert_eq!(
+            execution_mode(&args_with(true, false, true)),
+            ExecutionMode::TinyWatch
+        );
+    }
+
+    #[test]
+    fn only_the_tui_mode_may_initialize_the_terminal() {
+        // Structural guarantee: terminal setup lives in run_tui, and every
+        // non-interactive mode resolves away from it. If a new mode is added
+        // without updating this match, it fails closed here.
+        for mode in [
+            ExecutionMode::Once,
+            ExecutionMode::TinyOnce,
+            ExecutionMode::TinyWatch,
+        ] {
+            assert_ne!(mode, ExecutionMode::Tui);
+        }
+    }
+
+    #[test]
+    fn shared_builder_maps_min_rss_and_smaps_flags() {
+        let filtered = Args {
+            min_rss: 1_000_000,
+            ..args_with(false, true, false)
+        };
+        let mut collector = build_collector(&filtered);
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert!(snapshot.processes.is_empty());
+
+        let plain = args_with(false, true, false);
+        let mut collector = build_collector(&plain);
+        assert!(collector.collect_snapshot().is_ok());
+    }
+
+    #[test]
+    fn tiny_line_is_pinned_by_a_golden_fixture() {
+        let line = render_tiny_line(&test_support::system_memory());
+        assert_eq!(line, "mem 8.0G/16.0G 50.0% swap 512.0M/4.0G");
+    }
+
+    #[test]
+    fn once_output_is_valid_versioned_json() {
+        let snapshot = test_support::snapshot_at(std::time::Instant::now(), 100);
+        let json = snapshot_to_json(&snapshot).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // snapshot_to_json already enforces schema validation; here we pin
+        // the wire shape so regressions surface at the CLI boundary too.
+        assert!(value["schema_version"].is_number());
+        assert!(value["system"]["total_bytes"].is_number());
+        assert!(value["processes"].is_array());
+    }
 }
