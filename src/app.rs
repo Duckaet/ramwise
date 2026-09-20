@@ -129,8 +129,15 @@ impl App {
 
         // Dispatch alerts for fresh severe insights. Dispatch ignores calm
         // mode by design: load shedding never suppresses notifications.
-        self.alert_dispatcher
+        // Dry-run previews surface as log lines so the mode is observable.
+        let emitted = self
+            .alert_dispatcher
             .dispatch(&self.analyzer.insights(), Instant::now());
+        if self.alert_dispatcher.is_dry_run() {
+            for message in emitted {
+                tracing::info!("{message}");
+            }
+        }
 
         // Calm engages automatically under Critical pressure; only a manual
         // toggle releases it, so flickering levels cannot flap the UI.

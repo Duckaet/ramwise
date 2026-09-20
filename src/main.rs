@@ -67,7 +67,8 @@ struct Args {
     #[arg(long)]
     alert_dry_run: bool,
 
-    /// Quiet period in seconds before one alert may notify again
+    /// Quiet period in seconds before one alert may notify again (min 1:
+    /// zero would page every tick)
     #[arg(long, default_value = "60")]
     alert_cooldown_secs: u64,
 
@@ -115,7 +116,7 @@ async fn main() -> Result<()> {
     app.calm.active = args.calm;
     app.alert_dispatcher = alerts::AlertDispatcher::new(alerts::AlertConfig {
         dry_run: args.alert_dry_run,
-        cooldown: std::time::Duration::from_secs(args.alert_cooldown_secs),
+        cooldown: std::time::Duration::from_secs(args.alert_cooldown_secs.max(1)),
         sink: match args.alert_sink {
             AlertSinkArg::Log => alerts::AlertSink::Log,
             AlertSinkArg::Stderr => alerts::AlertSink::Stderr,

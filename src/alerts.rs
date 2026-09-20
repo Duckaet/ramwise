@@ -75,60 +75,81 @@ impl AlertDispatcher {
             if insight.severity < self.config.min_severity || insight.acknowledged {
                 continue;
             }
-            if let Some(notified) = self.notified_at.get(&insight.id)
+            // Escalations re-notify: a Warning that becomes Critical is a
+            // new fact, not a duplicate.
+            let key = format!("{}:{}", insight.id, insight.severity.as_str());
+            if let Some(notified) = self.notified_at.get(&key)
                 && now.saturating_duration_since(*notified) < self.config.cooldown
             {
                 continue;
             }
             let message = format!(
                 "[{}] {}: {}",
-                severity_label(insight.severity),
+                insight.severity.as_str(),
                 insight.title,
                 insight.suggestion
             );
-            let message = if self.config.dry_run {
-                format!("[dry-run] {message}")
-            } else {
-                match self.config.sink {
-                    AlertSink::Log => tracing::warn!("{message}"),
-                    AlertSink::Stderr => eprintln!("{message}"),
-                }
-                message
-            };
-            self.notified_at.insert(insight.id.clone(), now);
+            if self.config.dry_run {
+                // Dry runs preview without side effects: no sink, and no
+                // bookkeeping that could suppress a later real notification.
+                emitted.push(format!("[dry-run] {message}"));
+                continue;
+            }
+            match self.config.sink {
+                AlertSink::Log => tracing::warn!("{message}"),
+                AlertSink::Stderr => eprintln!("{message}"),
+            }
+            self.notified_at.insert(key, now);
             emitted.push(message);
         }
         emitted
     }
-}
 
-fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "CRITICAL",
-        Severity::Warning => "warning",
-        Severity::Info => "info",
+    /// Whether dispatch only previews (used to surface dry-run output).
+    pub fn is_dry_run(&self) -> bool {
+        self.config.dry_run
     }
 }
 
 /// Calm mode: shed expensive UI work under load. Rendering the trend chart
 /// is the first thing paused; collection, analysis and alert dispatch are
 /// untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CalmMode {
     pub active: bool,
+    /// Whether automatic engagement may fire. A manual release disarms
+    /// until pressure clears, so sustained Critical cannot re-latch over
+    /// the user's explicit choice.
+    auto_armed: bool,
+}
+
+impl Default for CalmMode {
+    fn default() -> Self {
+        Self {
+            active: false,
+            auto_armed: true,
+        }
+    }
 }
 
 impl CalmMode {
-    /// Engage automatically under Critical pressure. Disengaging is always
-    /// manual, so a flickering level cannot flap the UI.
+    /// Engage automatically under Critical pressure. Disengaging is manual
+    /// (or automatic when pressure clears, which re-arms).
     pub fn auto_engage(&mut self, critical: bool) {
         if critical {
-            self.active = true;
+            if self.auto_armed {
+                self.active = true;
+            }
+        } else {
+            self.auto_armed = true;
         }
     }
 
     pub fn toggle(&mut self) {
         self.active = !self.active;
+        if !self.active {
+            self.auto_armed = false;
+        }
     }
 }
 
@@ -142,6 +163,19 @@ mod tests {
 
     #[test]
     fn dispatch_notifies_once_per_cooldown() {
+        // Log sink without a subscriber is a silent no-op: cooldown
+        // behavior stays deterministic without capturing global sinks.
+        let mut dispatcher = AlertDispatcher::new(AlertConfig::default());
+        let warning = insight("w1", Severity::Warning);
+        let now = Instant::now();
+        assert_eq!(dispatcher.dispatch(&[&warning], now).len(), 1);
+        assert!(dispatcher.dispatch(&[&warning], now).is_empty());
+        let later = now + Duration::from_secs(61);
+        assert_eq!(dispatcher.dispatch(&[&warning], later).len(), 1);
+    }
+
+    #[test]
+    fn dry_run_previews_without_bookkeeping() {
         let mut dispatcher = AlertDispatcher::new(AlertConfig {
             dry_run: true,
             ..AlertConfig::default()
@@ -151,17 +185,14 @@ mod tests {
         let first = dispatcher.dispatch(&[&warning], now);
         assert_eq!(first.len(), 1);
         assert!(first[0].contains("[dry-run]"));
-        assert!(dispatcher.dispatch(&[&warning], now).is_empty());
-        let later = now + Duration::from_secs(61);
-        assert_eq!(dispatcher.dispatch(&[&warning], later).len(), 1);
+        // No bookkeeping: a later real dispatcher for the same insight
+        // still notifies (dry runs never suppress real alerts).
+        assert!(dispatcher.notified_at.is_empty());
     }
 
     #[test]
     fn info_insights_and_acknowledged_never_page() {
-        let mut dispatcher = AlertDispatcher::new(AlertConfig {
-            dry_run: true,
-            ..AlertConfig::default()
-        });
+        let mut dispatcher = AlertDispatcher::new(AlertConfig::default());
         let info = insight("i1", Severity::Info);
         assert!(dispatcher.dispatch(&[&info], Instant::now()).is_empty());
         let mut warning = insight("w1", Severity::Warning);
@@ -171,16 +202,32 @@ mod tests {
 
     #[test]
     fn expired_cooldowns_are_pruned() {
-        let mut dispatcher = AlertDispatcher::new(AlertConfig {
-            dry_run: true,
-            ..AlertConfig::default()
-        });
-        let warning = insight("w1", Severity::Warning);
+        let mut dispatcher = AlertDispatcher::new(AlertConfig::default());
         let now = Instant::now();
+        // Seed an entry whose cooldown already expired under a distinct id.
+        dispatcher
+            .notified_at
+            .insert("old".into(), now - Duration::from_secs(120));
+        let warning = insight("w1", Severity::Warning);
         dispatcher.dispatch(&[&warning], now);
-        assert_eq!(dispatcher.notified_at.len(), 1);
-        dispatcher.dispatch(&[&warning], now + Duration::from_secs(61));
-        assert_eq!(dispatcher.notified_at.len(), 1);
+        // The expired entry is gone; only the fresh notification remains.
+        assert_eq!(
+            dispatcher.notified_at.keys().collect::<Vec<_>>(),
+            vec!["w1:WARN"]
+        );
+    }
+
+    #[test]
+    fn severity_escalation_re_notifies() {
+        let mut dispatcher = AlertDispatcher::new(AlertConfig::default());
+        let now = Instant::now();
+        let warning = insight("p1", Severity::Warning);
+        assert_eq!(dispatcher.dispatch(&[&warning], now).len(), 1);
+        // Same id, worse severity: a new fact, not a duplicate.
+        let critical = insight("p1", Severity::Critical);
+        assert_eq!(dispatcher.dispatch(&[&critical], now).len(), 1);
+        // Same severity again: still cooling down.
+        assert!(dispatcher.dispatch(&[&critical], now).is_empty());
     }
 
     #[test]
@@ -190,9 +237,14 @@ mod tests {
         assert!(!calm.active);
         calm.auto_engage(true);
         assert!(calm.active);
-        calm.auto_engage(false);
-        assert!(calm.active);
+        // Manual release holds through sustained Critical...
         calm.toggle();
         assert!(!calm.active);
+        calm.auto_engage(true);
+        assert!(!calm.active);
+        // ...until pressure clears, which re-arms automatic engagement.
+        calm.auto_engage(false);
+        calm.auto_engage(true);
+        assert!(calm.active);
     }
 }
