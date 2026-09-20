@@ -3,10 +3,15 @@
 use anyhow::{Context, Result};
 use procfs::process::all_processes;
 use procfs::{Current, Meminfo};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use super::system_inputs::{
+    PRESSURE_MEMORY_PATH, TimedSample, VMSTAT_PATH, read_memory_pressure, read_vmstat_sample,
+    swap_rates,
+};
 use super::types::{MemorySnapshot, ProcessMemory, SystemMemory};
 
 /// Memory data collector that reads from /proc
@@ -17,6 +22,13 @@ pub struct Collector {
     collect_smaps: bool,
     /// Minimum RSS to include a process (filter out tiny processes) - in bytes
     min_rss_bytes: u64,
+    /// Previous vmstat reading for sample-to-sample swap rates; `None` until
+    /// the first successful read so the first snapshot reports unknown rates
+    prev_vmstat: Option<TimedSample>,
+    /// vmstat input path (well-known `/proc/vmstat` live; fixture in tests)
+    vmstat_path: PathBuf,
+    /// memory-pressure input path (well-known `/proc/pressure/memory` live)
+    pressure_path: PathBuf,
 }
 
 impl Collector {
@@ -26,6 +38,9 @@ impl Collector {
             interval: Duration::from_secs(1),
             collect_smaps: true,
             min_rss_bytes: 1024 * 1024, // 1 MB minimum
+            prev_vmstat: None,
+            vmstat_path: PathBuf::from(VMSTAT_PATH),
+            pressure_path: PathBuf::from(PRESSURE_MEMORY_PATH),
         }
     }
 
@@ -48,7 +63,7 @@ impl Collector {
     }
 
     /// Collect a single memory snapshot
-    pub fn collect_snapshot(&self) -> Result<MemorySnapshot> {
+    pub fn collect_snapshot(&mut self) -> Result<MemorySnapshot> {
         let timestamp = Instant::now();
 
         // Collect system memory info
@@ -66,9 +81,27 @@ impl Collector {
         })
     }
 
-    /// Collect system-wide memory information from /proc/meminfo
-    fn collect_system_memory(&self) -> Result<SystemMemory> {
+    /// Collect system-wide memory information from /proc/meminfo.
+    ///
+    /// `/proc/meminfo` is required: without it there is no snapshot. The
+    /// vmstat and pressure inputs are best-effort instead — a missing file
+    /// leaves cumulative counters at zero, rates at unknown, and pressure
+    /// averages absent, which the export contract marks as explicit
+    /// capability gaps.
+    fn collect_system_memory(&mut self) -> Result<SystemMemory> {
         let meminfo = Meminfo::current().context("Failed to read /proc/meminfo")?;
+
+        let now = Instant::now();
+        let current_vmstat = read_vmstat_sample(&self.vmstat_path)
+            .ok()
+            .map(|sample| TimedSample { sample, at: now });
+        let rates = match (&self.prev_vmstat, &current_vmstat) {
+            (Some(previous), Some(current)) => swap_rates(previous, current),
+            _ => None,
+        };
+        self.prev_vmstat = current_vmstat;
+
+        let pressure = read_memory_pressure(&self.pressure_path).unwrap_or_default();
 
         Ok(SystemMemory {
             total: meminfo.mem_total,
@@ -78,7 +111,21 @@ impl Collector {
             cached: meminfo.cached,
             swap_total: meminfo.swap_total,
             swap_used: meminfo.swap_total.saturating_sub(meminfo.swap_free),
+            swap_in_pages: self
+                .prev_vmstat
+                .map(|timed| timed.sample.pswpin)
+                .unwrap_or(0),
+            swap_out_pages: self
+                .prev_vmstat
+                .map(|timed| timed.sample.pswpout)
+                .unwrap_or(0),
+            swap_in_rate: rates.map(|rates| rates.in_per_sec),
+            swap_out_rate: rates.map(|rates| rates.out_per_sec),
             slab: meminfo.slab,
+            slab_reclaimable: meminfo.s_reclaimable.unwrap_or(0),
+            slab_unreclaimable: meminfo.s_unreclaim.unwrap_or(0),
+            kernel_stack: meminfo.kernel_stack.unwrap_or(0),
+            pressure,
             shared: meminfo.shmem.unwrap_or(0),
             active: meminfo.active,
             inactive: meminfo.inactive,
@@ -204,7 +251,7 @@ impl Collector {
     }
 
     /// Run the collector as an async task, sending snapshots to a channel
-    pub async fn run(self, tx: mpsc::Sender<MemorySnapshot>) -> Result<()> {
+    pub async fn run(mut self, tx: mpsc::Sender<MemorySnapshot>) -> Result<()> {
         let mut ticker = interval(self.interval);
 
         loop {
@@ -240,6 +287,30 @@ fn kib_to_bytes(value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn fixture_inputs(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ramwise-{}-{}-{}",
+            test,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmstat = dir.join("vmstat");
+        let pressure = dir.join("pressure");
+        let mut vmstat_file = std::fs::File::create(&vmstat).unwrap();
+        writeln!(vmstat_file, "pswpin 1200\npswpout 3400\n").unwrap();
+        let mut pressure_file = std::fs::File::create(&pressure).unwrap();
+        writeln!(
+            pressure_file,
+            "some avg10=1.25 avg60=0.50 avg300=0.10 total=1\nfull avg10=0.25 avg60=0.10 avg300=0.02 total=2\n"
+        )
+        .unwrap();
+        (dir, vmstat, pressure)
+    }
 
     #[test]
     fn kib_conversion_is_explicit_and_saturating() {
@@ -259,5 +330,31 @@ mod tests {
         assert_eq!(mem.used(), 8 * 1024 * 1024 * 1024);
         assert!((mem.usage_percent() - 50.0).abs() < 0.01);
         assert_eq!(mem.swap_percent(), 0.0);
+    }
+
+    #[test]
+    fn fixture_inputs_flow_into_the_snapshot() {
+        let (_dir, vmstat, pressure) = fixture_inputs("flow");
+        let mut collector = Collector::new();
+        collector.vmstat_path = vmstat;
+        collector.pressure_path = pressure;
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert_eq!(snapshot.system.swap_in_pages, 1200);
+        assert_eq!(snapshot.system.swap_out_pages, 3400);
+        assert_eq!(snapshot.system.swap_in_rate, None);
+        assert_eq!(snapshot.system.pressure.some_avg10, Some(1.25));
+        assert_eq!(snapshot.system.pressure.full_avg300, Some(0.02));
+    }
+
+    #[test]
+    fn missing_inputs_degrade_to_gaps_without_failing() {
+        let missing = PathBuf::from("/nonexistent-ramwise-fixture/inputs");
+        let mut collector = Collector::new();
+        collector.vmstat_path = missing.join("vmstat");
+        collector.pressure_path = missing.join("pressure");
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert_eq!(snapshot.system.swap_in_pages, 0);
+        assert_eq!(snapshot.system.swap_in_rate, None);
+        assert!(!snapshot.system.pressure.is_available());
     }
 }
