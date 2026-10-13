@@ -148,6 +148,7 @@ pub struct ExportSnapshot {
 pub type SnapshotExport = ExportSnapshot;
 
 impl ExportSnapshot {
+    #[allow(dead_code)]
     /// Reject a payload from a schema version this binary does not understand,
     /// or one carrying non-finite floats (rates and pressure must be real
     /// numbers or explicit nulls, never NaN or infinity).
@@ -220,6 +221,7 @@ impl ExportSnapshot {
     }
 
     /// Deterministic fixture for compatibility and serialization tests.
+    #[allow(dead_code)]
     #[cfg(test)]
     pub fn fixture() -> Self {
         let mut fixture = Self::from_runtime(&MemorySnapshot::default());

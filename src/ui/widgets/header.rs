@@ -12,6 +12,8 @@ use crate::collector::SystemMemory;
 use crate::ui::Theme;
 use crate::utils::format_bytes;
 
+use crate::ui::theme::BarType;
+
 /// Modern header bar widget
 pub struct HeaderWidget<'a> {
     system: &'a SystemMemory,
@@ -31,7 +33,10 @@ impl<'a> HeaderWidget<'a> {
 
 impl<'a> Widget for HeaderWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        const RAM_BAR_WIDTH: usize = 12;
         let sys = self.system;
+        let mut ram = vec![];
+        ram.push(Span::styled("RAM ", Style::default().fg(self.theme.fg_dim)));
 
         // Build the header line with modern styling
 
@@ -43,25 +48,41 @@ impl<'a> Widget for HeaderWidget<'a> {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let dot = Span::styled(" · ", self.theme.muted_style());
+        let dot = Span::styled(
+            format!(" { } ", self.theme.header_dot),
+            self.theme.muted_style(),
+        );
 
-        // RAM usage with smooth gradient bar
+        // RAM usage with truly smooth gradient bar
         let ram_percent = sys.usage_percent();
         let ram_color = self.theme.mem_color_interpolated(ram_percent);
-        let ram_bar = create_sleek_bar(ram_percent, 12);
+        let ram_color_dim = self.theme.mem_color_dim(ram_percent);
+        let ram_bar = match self.theme.header_bar_type {
+            BarType::Standard => Theme::create_sleek_bar(&self.theme, ram_percent, RAM_BAR_WIDTH),
+            BarType::Gradient => Theme::create_sleek_bar(&self.theme, ram_percent, RAM_BAR_WIDTH),
+            BarType::Fancy => Theme::create_fancy_bar(&self.theme, ram_percent, RAM_BAR_WIDTH),
+            BarType::FancyGradient => {
+                Theme::create_fancy_bar(&self.theme, ram_percent, RAM_BAR_WIDTH)
+            }
+        };
+        if self.theme.header_bar_type == BarType::Gradient
+            || self.theme.header_bar_type == BarType::FancyGradient
+        {
+            Theme::create_gradient_bar(ram_bar, RAM_BAR_WIDTH, ram_color, ram_color_dim, &mut ram);
+        } else {
+            let ram_bar_style = Style::default().fg(ram_color);
+            let span = Span::styled(ram_bar, ram_bar_style);
+            ram.push(span);
+        };
 
-        let ram = vec![
-            Span::styled("RAM ", Style::default().fg(self.theme.fg_dim)),
-            Span::styled(ram_bar, Style::default().fg(ram_color)),
-            Span::styled(
-                format!(" {}/{} ", format_bytes(sys.used()), format_bytes(sys.total),),
-                Style::default().fg(self.theme.fg),
-            ),
-            Span::styled(
-                format!("{:.0}%", ram_percent),
-                Style::default().fg(ram_color).add_modifier(Modifier::BOLD),
-            ),
-        ];
+        ram.push(Span::styled(
+            format!(" {}/{} ", format_bytes(sys.used()), format_bytes(sys.total),),
+            Style::default().fg(self.theme.fg),
+        ));
+        ram.push(Span::styled(
+            format!("{:.0}%", ram_percent),
+            Style::default().fg(ram_color).add_modifier(Modifier::BOLD),
+        ));
 
         // Swap usage with status indicator
         let swap_percent = sys.swap_percent();
@@ -75,11 +96,11 @@ impl<'a> Widget for HeaderWidget<'a> {
             };
 
             let status_icon = if swap_percent > 80.0 {
-                "▲"
+                self.theme.triangle.clone()
             } else if swap_percent > 50.0 {
-                "●"
+                self.theme.full_circle.clone()
             } else {
-                "○"
+                self.theme.empty_circle.clone()
             };
 
             vec![
@@ -136,27 +157,8 @@ impl<'a> Widget for HeaderWidget<'a> {
         spans.extend(help);
 
         let line = Line::from(spans);
-        let paragraph = Paragraph::new(line).style(Style::default().bg(self.theme.bg_elevated));
+        let paragraph = Paragraph::new(line).style(Style::default().bg(self.theme.header_bg));
 
         paragraph.render(area, buf);
     }
-}
-
-/// Create a sleek progress bar with partial block characters
-fn create_sleek_bar(percent: f64, width: usize) -> String {
-    let chars = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-    let total_eighths = ((percent / 100.0) * (width * 8) as f64).round() as usize;
-    let full_blocks = total_eighths / 8;
-    let partial = total_eighths % 8;
-
-    let mut bar = "█".repeat(full_blocks);
-
-    if partial > 0 && full_blocks < width {
-        bar.push(chars[partial]);
-    }
-
-    let remaining = width.saturating_sub(bar.chars().count());
-    bar.push_str(&"░".repeat(remaining));
-
-    bar
 }
