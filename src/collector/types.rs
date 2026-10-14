@@ -41,9 +41,9 @@ pub struct SystemMemory {
     /// Memory available for starting new applications
     pub available: u64,
     /// Completely unused memory
-    pub free: u64,
+    pub free: Option<u64>,
     /// Memory used for disk block buffers
-    pub buffers: u64,
+    pub buffers: Option<u64>,
     /// Memory used for page cache (file contents)
     pub cached: u64,
     /// Total swap space
@@ -60,26 +60,28 @@ pub struct SystemMemory {
     /// Swap-out rate in pages per second; `None` under the same conditions
     pub swap_out_rate: Option<f64>,
     /// Kernel slab allocator memory
-    pub slab: u64,
+    pub slab: Option<u64>,
     /// Reclaimable part of slab (`SReclaimable`); zero when the kernel omits it
-    pub slab_reclaimable: u64,
+    pub slab_reclaimable: Option<u64>,
     /// Unreclaimable part of slab (`SUnreclaim`); zero when the kernel omits it
-    pub slab_unreclaimable: u64,
+    pub slab_unreclaimable: Option<u64>,
     /// Memory allocated to kernel stacks; zero when the kernel omits it
-    pub kernel_stack: u64,
+    pub kernel_stack: Option<u64>,
+    /// Memory allocated to the windows kernel
+    pub windows_kernel_pool: Option<u64>,
     /// Memory-pressure (PSI) inputs; all `None` when `/proc/pressure/memory`
     /// is missing, which downstream marks as an explicit capability gap
-    pub pressure: MemoryPressure,
+    pub pressure: Option<MemoryPressure>,
     /// Shared memory (shmem, tmpfs)
-    pub shared: u64,
+    pub shared: Option<u64>,
     /// Memory actively being used
-    pub active: u64,
+    pub active: Option<u64>,
     /// Memory not recently used (candidate for reclaim)
-    pub inactive: u64,
+    pub inactive: Option<u64>,
     /// Dirty pages waiting to be written to disk
     pub dirty: u64,
     /// Memory being actively written to disk
-    pub writeback: u64,
+    pub writeback: Option<u64>,
     /// Memory mapped into page tables
     pub mapped: u64,
 }
@@ -127,7 +129,7 @@ pub struct RegionMemory {
     pub path: Option<String>,
     pub size: u64,
     pub rss: u64,
-    pub pss: u64,
+    pub pss: Option<u64>,
     pub shared_clean: u64,
     pub shared_dirty: u64,
     pub private_clean: u64,
@@ -144,7 +146,7 @@ pub struct ProcessMemory {
     /// Full command line
     pub cmdline: String,
     /// Process state (R, S, D, Z, T, etc.)
-    pub state: char,
+    pub state: Option<char>,
     /// Parent process ID
     pub ppid: i32,
     /// User ID
@@ -162,31 +164,33 @@ pub struct ProcessMemory {
 
     // === Advanced stats (from smaps_rollup) ===
     /// Proportional Set Size - shared memory divided proportionally
-    pub pss: u64,
+    pub pss: Option<u64>,
     /// Unique Set Size - memory unique to this process
-    pub uss: u64,
+    pub uss: Option<u64>,
     /// Swap usage
     pub swap: u64,
 
     // === Memory breakdown by type ===
     /// Heap memory
-    pub heap: u64,
+    pub heap: Option<u64>,
     /// Stack memory
-    pub stack: u64,
+    pub stack: Option<u64>,
     /// Memory-mapped libraries
-    pub libs: u64,
+    pub libs: Option<u64>,
     /// Anonymous mappings (malloc, etc.)
-    pub anonymous: u64,
+    pub anonymous: Option<u64>,
     /// Memory-mapped files
-    pub file_mappings: u64,
+    pub file_mappings: Option<u64>,
 
     // === Page fault stats ===
-    /// Minor page faults (no disk I/O)
-    pub minor_faults: u64,
-    /// Major page faults (disk I/O required)
-    pub major_faults: u64,
+    /// Minor page faults (no disk I/O) (Linux only)
+    pub minor_faults: Option<u64>,
+    /// Major page faults (disk I/O required) (Linux only)
+    pub major_faults: Option<u64>,
+    /// All page faults (Windows only)
+    pub faults: Option<u64>,
 
-    // === Detailed regions (optional, expensive to collect) ===
+    /// === Detailed regions (optional, expensive to collect, not on windows) ===
     pub regions: Option<Vec<RegionMemory>>,
 }
 
@@ -196,23 +200,24 @@ impl Default for ProcessMemory {
             pid: 0,
             name: String::new(),
             cmdline: String::new(),
-            state: '?',
+            state: Some('?'),
             ppid: 0,
             uid: 0,
             rss: 0,
             vss: 0,
             shared: 0,
             private: 0,
-            pss: 0,
-            uss: 0,
+            pss: Some(0),
+            uss: Some(0),
             swap: 0,
-            heap: 0,
-            stack: 0,
-            libs: 0,
-            anonymous: 0,
-            file_mappings: 0,
-            minor_faults: 0,
-            major_faults: 0,
+            heap: Some(0),
+            stack: Some(0),
+            libs: Some(0),
+            anonymous: Some(0),
+            file_mappings: Some(0),
+            minor_faults: Some(0),
+            major_faults: Some(0),
+            faults: None,
             regions: None,
         }
     }
@@ -315,7 +320,7 @@ impl MemorySnapshot {
 
     /// Calculate total PSS (more accurate, accounts for sharing)
     pub fn total_process_pss(&self) -> u64 {
-        self.processes.iter().map(|p| p.pss).sum()
+        self.processes.iter().map(|p| p.pss.unwrap()).sum()
     }
 }
 

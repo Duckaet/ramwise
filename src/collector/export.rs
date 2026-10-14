@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::types::{MemoryRegion, MemorySnapshot, ProcessMemory, RegionMemory, SystemMemory};
+#[allow(unused_imports)]
+use super::types::{
+    MemoryPressure, MemoryRegion, MemorySnapshot, ProcessMemory, RegionMemory, SystemMemory,
+};
 
 /// Current wire-format version for exported snapshots.
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -40,8 +43,8 @@ pub struct CollectorMetadata {
 pub struct ExportSystemMemory {
     pub total_bytes: u64,
     pub available_bytes: u64,
-    pub free_bytes: u64,
-    pub buffers_bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub buffers_bytes: Option<u64>,
     pub cached_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
@@ -52,25 +55,25 @@ pub struct ExportSystemMemory {
     pub swap_out_pages: u64,
     pub swap_in_rate_per_sec: Option<f64>,
     pub swap_out_rate_per_sec: Option<f64>,
-    pub slab_bytes: u64,
+    pub slab_bytes: Option<u64>,
     /// Added after schema 1 shipped: defaulted on read so older files parse.
     #[serde(default)]
-    pub slab_reclaimable_bytes: u64,
+    pub slab_reclaimable_bytes: Option<u64>,
     #[serde(default)]
-    pub slab_unreclaimable_bytes: u64,
+    pub slab_unreclaimable_bytes: Option<u64>,
     #[serde(default)]
-    pub kernel_stack_bytes: u64,
+    pub kernel_stack_bytes: Option<u64>,
     pub pressure_some_avg10: Option<f32>,
     pub pressure_some_avg60: Option<f32>,
     pub pressure_some_avg300: Option<f32>,
     pub pressure_full_avg10: Option<f32>,
     pub pressure_full_avg60: Option<f32>,
     pub pressure_full_avg300: Option<f32>,
-    pub shared_bytes: u64,
-    pub active_bytes: u64,
-    pub inactive_bytes: u64,
+    pub shared_bytes: Option<u64>,
+    pub active_bytes: Option<u64>,
+    pub inactive_bytes: Option<u64>,
     pub dirty_bytes: u64,
-    pub writeback_bytes: u64,
+    pub writeback_bytes: Option<u64>,
     pub mapped_bytes: u64,
 }
 
@@ -82,7 +85,7 @@ pub struct ExportMemoryRegion {
     pub path: Option<String>,
     pub size_bytes: u64,
     pub rss_bytes: u64,
-    pub pss_bytes: u64,
+    pub pss_bytes: Option<u64>,
     pub shared_clean_bytes: u64,
     pub shared_dirty_bytes: u64,
     pub private_clean_bytes: u64,
@@ -110,23 +113,24 @@ pub struct ExportProcessMemory {
     pub name: String,
     /// May contain sensitive command-line arguments; callers should sanitize before sharing.
     pub cmdline: String,
-    pub state: char,
+    pub state: Option<char>,
     pub ppid: i32,
     pub uid: u32,
     pub rss_bytes: u64,
     pub vss_bytes: u64,
     pub shared_bytes: u64,
     pub private_bytes: u64,
-    pub pss_bytes: u64,
-    pub uss_bytes: u64,
+    pub pss_bytes: Option<u64>,
+    pub uss_bytes: Option<u64>,
     pub swap_bytes: u64,
-    pub heap_bytes: u64,
-    pub stack_bytes: u64,
-    pub libs_bytes: u64,
-    pub anonymous_bytes: u64,
-    pub file_mappings_bytes: u64,
-    pub minor_faults: u64,
-    pub major_faults: u64,
+    pub heap_bytes: Option<u64>,
+    pub stack_bytes: Option<u64>,
+    pub libs_bytes: Option<u64>,
+    pub anonymous_bytes: Option<u64>,
+    pub file_mappings_bytes: Option<u64>,
+    pub minor_faults: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub faults: Option<u64>,
     pub regions: Option<Vec<ExportMemoryRegion>>,
 }
 
@@ -174,7 +178,7 @@ impl ExportSnapshot {
         .into_iter()
         .flatten()
         .all(f32::is_finite);
-        if finite && pressures {
+        if finite && ((pressures && cfg!(target_os = "linux")) || cfg!(target_os = "windows")) {
             Ok(())
         } else {
             Err("non-finite swap rate or pressure value".to_string())
@@ -190,7 +194,11 @@ impl ExportSnapshot {
             ("swap_rates".to_string(), Capability::Unavailable),
             ("pressure".to_string(), Capability::Unavailable),
         ]);
-        if snapshot.processes.iter().any(|p| p.pss != 0 || p.uss != 0) {
+        if snapshot
+            .processes
+            .iter()
+            .any(|p| p.pss.unwrap_or(0) != 0 || p.uss.unwrap_or(0) != 0)
+        {
             capabilities.insert("smaps_rollup".to_string(), Capability::Available);
         }
         if snapshot.processes.iter().any(|p| p.regions.is_some()) {
@@ -199,7 +207,9 @@ impl ExportSnapshot {
         if snapshot.system.swap_in_rate.is_some() && snapshot.system.swap_out_rate.is_some() {
             capabilities.insert("swap_rates".to_string(), Capability::Available);
         }
-        if snapshot.system.pressure.is_available() {
+        if let Some(pressure) = snapshot.system.pressure
+            && pressure.is_available()
+        {
             capabilities.insert("pressure".to_string(), Capability::Available);
         }
         Self {
@@ -245,6 +255,27 @@ fn wall_clock_ms() -> u64 {
 
 impl From<&SystemMemory> for ExportSystemMemory {
     fn from(value: &SystemMemory) -> Self {
+        let pressure_some_avg10: Option<f32>;
+        let pressure_some_avg60: Option<f32>;
+        let pressure_some_avg300: Option<f32>;
+        let pressure_full_avg10: Option<f32>;
+        let pressure_full_avg60: Option<f32>;
+        let pressure_full_avg300: Option<f32>;
+        if let Some(pressure) = value.pressure {
+            pressure_some_avg10 = pressure.some_avg10;
+            pressure_some_avg60 = pressure.some_avg60;
+            pressure_some_avg300 = pressure.some_avg300;
+            pressure_full_avg10 = pressure.full_avg10;
+            pressure_full_avg60 = pressure.full_avg60;
+            pressure_full_avg300 = pressure.full_avg300;
+        } else {
+            pressure_some_avg10 = None;
+            pressure_some_avg60 = None;
+            pressure_some_avg300 = None;
+            pressure_full_avg10 = None;
+            pressure_full_avg60 = None;
+            pressure_full_avg300 = None;
+        };
         Self {
             total_bytes: value.total,
             available_bytes: value.available,
@@ -261,12 +292,12 @@ impl From<&SystemMemory> for ExportSystemMemory {
             slab_reclaimable_bytes: value.slab_reclaimable,
             slab_unreclaimable_bytes: value.slab_unreclaimable,
             kernel_stack_bytes: value.kernel_stack,
-            pressure_some_avg10: value.pressure.some_avg10,
-            pressure_some_avg60: value.pressure.some_avg60,
-            pressure_some_avg300: value.pressure.some_avg300,
-            pressure_full_avg10: value.pressure.full_avg10,
-            pressure_full_avg60: value.pressure.full_avg60,
-            pressure_full_avg300: value.pressure.full_avg300,
+            pressure_some_avg10,
+            pressure_some_avg60,
+            pressure_some_avg300,
+            pressure_full_avg10,
+            pressure_full_avg60,
+            pressure_full_avg300,
             shared_bytes: value.shared,
             active_bytes: value.active,
             inactive_bytes: value.inactive,
@@ -300,6 +331,7 @@ impl From<&ProcessMemory> for ExportProcessMemory {
             file_mappings_bytes: value.file_mappings,
             minor_faults: value.minor_faults,
             major_faults: value.major_faults,
+            faults: value.faults,
             regions: value
                 .regions
                 .as_ref()
@@ -396,8 +428,8 @@ mod tests {
             pid: 7,
             name: "worker".into(),
             rss: 2048,
-            pss: 1536,
-            uss: 1024,
+            pss: Some(1536),
+            uss: Some(1024),
             regions: Some(vec![RegionMemory {
                 region_type: Some(MemoryRegion::Heap),
                 path: Some("[heap]".into()),
@@ -462,22 +494,30 @@ mod tests {
         }
         let decoded: ExportSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.system.swap_in_pages, 0);
-        assert_eq!(decoded.system.kernel_stack_bytes, 0);
+        assert_eq!(decoded.system.kernel_stack_bytes, None); //used to be 0 but it's now none because the app respects that there can be no kernel_stack_bytes instead of forcing 0. This is correct though.
         assert_eq!(decoded.system.pressure_full_avg300, None);
         assert!(decoded.validate().is_ok());
     }
 
     #[test]
+    #[allow(unused_assignments)]
     fn present_rates_and_pressure_mark_capabilities_available() {
         let mut snapshot = MemorySnapshot::default();
         snapshot.system.swap_in_pages = 1200;
         snapshot.system.swap_out_pages = 3400;
         snapshot.system.swap_in_rate = Some(10.0);
         snapshot.system.swap_out_rate = Some(20.0);
-        snapshot.system.pressure.some_avg10 = Some(1.25);
+        if cfg!(target_os = "linux") {
+            snapshot.system.pressure = Some(MemoryPressure {
+                some_avg10: Some(1.25),
+                ..Default::default()
+            });
+        }
         let export = ExportSnapshot::from_runtime(&snapshot);
         assert_eq!(export.capabilities["swap_rates"], Capability::Available);
-        assert_eq!(export.capabilities["pressure"], Capability::Available);
+        if cfg!(target_os = "linux") {
+            assert_eq!(export.capabilities["pressure"], Capability::Available);
+        }
         assert_eq!(export.system.swap_in_pages, 1200);
         assert_eq!(export.system.swap_in_rate_per_sec, Some(10.0));
         assert_eq!(export.system.pressure_some_avg10, Some(1.25));

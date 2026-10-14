@@ -10,6 +10,7 @@ use ratatui::{
 
 use crate::collector::ProcessMemory;
 use crate::ui::Theme;
+use crate::ui::globals::{RSS_NAME, VSS_NAME};
 use crate::utils::format_bytes;
 
 /// Modern detail panel widget
@@ -91,16 +92,21 @@ impl<'a> Widget for DetailPanelWidget<'a> {
         let mut lines = Vec::new();
 
         // Process info row with status chip
-        let state_style = match proc.state {
-            'R' => Style::default().fg(self.theme.success),
-            'S' => Style::default().fg(self.theme.info),
-            'D' => Style::default().fg(self.theme.warning),
-            'Z' => Style::default().fg(self.theme.error),
-            _ => Style::default().fg(self.theme.fg_dim),
-        };
+        let mut state_text = "".to_string();
+        let mut state_style = Style::default().fg(self.theme.fg_dim);
+        if let Some(state) = proc.state {
+            state_style = match state {
+                'R' => Style::default().fg(self.theme.success),
+                'S' => Style::default().fg(self.theme.info),
+                'D' => Style::default().fg(self.theme.warning),
+                'Z' => Style::default().fg(self.theme.error),
+                _ => state_style,
+            };
+            state_text = state_chip(state);
+        }
 
         lines.push(Line::from(vec![
-            Span::styled(state_chip(proc.state), state_style),
+            Span::styled(state_text, state_style),
             Span::styled("  ", Style::default()),
             Span::styled("PPID ", self.theme.muted_style()),
             Span::styled(
@@ -132,7 +138,7 @@ impl<'a> Widget for DetailPanelWidget<'a> {
         let total_for_bar = proc.vss.max(proc.rss);
 
         lines.push(create_memory_row(
-            "RSS",
+            RSS_NAME,
             proc.rss,
             total_for_bar,
             "Resident memory",
@@ -141,7 +147,7 @@ impl<'a> Widget for DetailPanelWidget<'a> {
         ));
 
         lines.push(create_memory_row(
-            "VSS",
+            VSS_NAME,
             proc.vss,
             total_for_bar,
             "Virtual size",
@@ -149,10 +155,12 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             false,
         ));
 
-        if proc.pss > 0 {
+        if let Some(pss) = proc.pss
+            && pss > 0
+        {
             lines.push(create_memory_row(
                 "PSS",
-                proc.pss,
+                pss,
                 proc.rss,
                 "Proportional",
                 self.theme,
@@ -160,9 +168,11 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             ));
         }
 
-        if proc.uss > 0 {
+        if let Some(uss) = proc.uss
+            && uss > 0
+        {
             lines.push(create_memory_row(
-                "USS", proc.uss, proc.rss, "Unique", self.theme, false,
+                "USS", uss, proc.rss, "Unique", self.theme, false,
             ));
         }
 
@@ -178,17 +188,20 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             self.theme,
         ));
 
-        lines.push(create_two_col(
-            ("Heap", proc.heap),
-            ("Stack", proc.stack),
-            self.theme,
-        ));
+        if !cfg!(target_os = "windows") {
+            // don't add incompatible types
+            lines.push(create_two_col(
+                ("Heap", proc.heap.unwrap()),
+                ("Stack", proc.stack.unwrap()),
+                self.theme,
+            ));
 
-        lines.push(create_two_col(
-            ("Libraries", proc.libs),
-            ("Anon", proc.anonymous),
-            self.theme,
-        ));
+            lines.push(create_two_col(
+                ("Libraries", proc.libs.unwrap()),
+                ("Anon", proc.anonymous.unwrap()),
+                self.theme,
+            ));
+        }
 
         // Swap indicator (if any)
         if proc.swap > 0 {
@@ -201,11 +214,21 @@ impl<'a> Widget for DetailPanelWidget<'a> {
         }
 
         // Page faults with severity indication
-        if proc.major_faults > 100 {
+        let mut fault_type = "";
+        let faults_of_interest = if let Some(maj_faults) = proc.major_faults {
+            fault_type = "Major";
+            maj_faults
+        } else if let Some(faults) = proc.faults {
+            faults
+        } else {
+            fault_type = "e";
+            0
+        };
+        if faults_of_interest > 100 {
             lines.push(Line::from(vec![
                 Span::styled(
                     "● ",
-                    Style::default().fg(if proc.major_faults > 1000 {
+                    Style::default().fg(if faults_of_interest > 1000 {
                         self.theme.warning
                     } else {
                         self.theme.fg_muted
@@ -213,8 +236,8 @@ impl<'a> Widget for DetailPanelWidget<'a> {
                 ),
                 Span::styled("Page faults: ", self.theme.dim_style()),
                 Span::styled(
-                    format!("{} major", proc.major_faults),
-                    if proc.major_faults > 1000 {
+                    format!("{} {type}", faults_of_interest, type=fault_type),
+                    if faults_of_interest > 1000 {
                         self.theme.warning_style()
                     } else {
                         Style::default().fg(self.theme.fg_dim)
@@ -244,7 +267,10 @@ impl<'a> Widget for DetailPanelWidget<'a> {
                         Style::default().fg(self.theme.fg_dim)
                     },
                 ),
-                Span::styled(" VSS/RSS ratio", self.theme.muted_style()),
+                Span::styled(
+                    format!(" {VSS_NAME}/{RSS_NAME} ratio"),
+                    self.theme.muted_style(),
+                ),
             ]));
         }
 

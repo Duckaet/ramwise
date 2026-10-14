@@ -46,8 +46,13 @@ const CSV_COLUMNS: &[&str] = &[
     "file_mappings_bytes",
     "minor_faults",
     "major_faults",
+    "faults",
     "cmdline",
 ];
+
+pub fn opt_u64_to_string(num: Option<u64>) -> String {
+    num.map_or_else(|| "unavailable".to_string(), |n| n.to_string())
+}
 
 /// Serialize one snapshot to versioned JSON text.
 pub fn render_json(snapshot: &ExportSnapshot) -> Result<String> {
@@ -180,23 +185,24 @@ pub fn render_csv(snapshot: &ExportSnapshot, include_details: bool) -> Result<St
         let mut row = vec![
             process.pid.to_string(),
             escape_csv(&process.name),
-            escape_csv(&process.state.to_string()),
+            escape_csv(&process.state.unwrap_or('?').to_string()),
             process.ppid.to_string(),
             process.uid.to_string(),
             process.rss_bytes.to_string(),
             process.vss_bytes.to_string(),
             process.shared_bytes.to_string(),
             process.private_bytes.to_string(),
-            process.pss_bytes.to_string(),
-            process.uss_bytes.to_string(),
+            opt_u64_to_string(process.pss_bytes),
+            opt_u64_to_string(process.uss_bytes),
             process.swap_bytes.to_string(),
-            process.heap_bytes.to_string(),
-            process.stack_bytes.to_string(),
-            process.libs_bytes.to_string(),
-            process.anonymous_bytes.to_string(),
-            process.file_mappings_bytes.to_string(),
-            process.minor_faults.to_string(),
-            process.major_faults.to_string(),
+            opt_u64_to_string(process.heap_bytes),
+            opt_u64_to_string(process.stack_bytes),
+            opt_u64_to_string(process.libs_bytes),
+            opt_u64_to_string(process.anonymous_bytes),
+            opt_u64_to_string(process.file_mappings_bytes),
+            opt_u64_to_string(process.minor_faults),
+            opt_u64_to_string(process.major_faults),
+            opt_u64_to_string(process.faults),
             escape_csv(&process.cmdline),
         ];
         if include_details {

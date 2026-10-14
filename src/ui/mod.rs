@@ -2,6 +2,7 @@
 //!
 //! This module contains all the Ratatui-based UI components for ramwise.
 
+pub mod globals;
 pub mod layout;
 pub mod theme;
 pub mod widgets;

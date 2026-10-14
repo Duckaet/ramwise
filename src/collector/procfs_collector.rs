@@ -108,8 +108,8 @@ impl Collector {
         Ok(SystemMemory {
             total: meminfo.mem_total,
             available: meminfo.mem_available.unwrap_or(meminfo.mem_free),
-            free: meminfo.mem_free,
-            buffers: meminfo.buffers,
+            free: Some(meminfo.mem_free),
+            buffers: Some(meminfo.buffers),
             cached: meminfo.cached,
             swap_total: meminfo.swap_total,
             swap_used: meminfo.swap_total.saturating_sub(meminfo.swap_free),
@@ -117,17 +117,18 @@ impl Collector {
             swap_out_pages,
             swap_in_rate,
             swap_out_rate,
-            slab: meminfo.slab,
-            slab_reclaimable: meminfo.s_reclaimable.unwrap_or(0),
-            slab_unreclaimable: meminfo.s_unreclaim.unwrap_or(0),
-            kernel_stack: meminfo.kernel_stack.unwrap_or(0),
-            pressure,
-            shared: meminfo.shmem.unwrap_or(0),
-            active: meminfo.active,
-            inactive: meminfo.inactive,
+            slab: Some(meminfo.slab),
+            slab_reclaimable: meminfo.s_reclaimable,
+            slab_unreclaimable: meminfo.s_unreclaim,
+            kernel_stack: meminfo.kernel_stack,
+            pressure: Some(pressure),
+            shared: meminfo.shmem,
+            active: Some(meminfo.active),
+            inactive: Some(meminfo.inactive),
             dirty: meminfo.dirty,
-            writeback: meminfo.writeback,
+            writeback: Some(meminfo.writeback),
             mapped: meminfo.mapped,
+            windows_kernel_pool: None,
         })
     }
 
@@ -220,7 +221,7 @@ impl Collector {
                 pid: proc.pid(),
                 name: stat.comm.clone(),
                 cmdline,
-                state: status.state.chars().next().unwrap_or('?'),
+                state: Some(status.state.chars().next().unwrap_or('?')),
                 ppid: stat.ppid,
                 uid: status.ruid,
                 rss: rss_bytes,
@@ -228,11 +229,11 @@ impl Collector {
                 shared,
                 private,
                 swap,
-                heap,
-                stack,
-                libs,
-                minor_faults: stat.minflt,
-                major_faults: stat.majflt,
+                heap: Some(heap),
+                stack: Some(stack),
+                libs: Some(libs),
+                minor_faults: Some(stat.minflt),
+                major_faults: Some(stat.majflt),
                 ..Default::default()
             };
 
@@ -246,13 +247,13 @@ impl Collector {
 
                     // Get values from the HashMap
                     // procfs parses smaps values with their `kB` suffix into bytes.
-                    process.pss = ext.get("Pss").copied().unwrap_or(0);
+                    process.pss = Some(ext.get("Pss").copied().unwrap_or(0));
 
                     let private_clean = ext.get("Private_Clean").copied().unwrap_or(0);
                     let private_dirty = ext.get("Private_Dirty").copied().unwrap_or(0);
-                    process.uss = private_clean + private_dirty;
+                    process.uss = Some(private_clean + private_dirty);
 
-                    process.anonymous = ext.get("Anonymous").copied().unwrap_or(0);
+                    process.anonymous = Some(ext.get("Anonymous").copied().unwrap_or(0));
 
                     let shared_clean = ext.get("Shared_Clean").copied().unwrap_or(0);
                     let shared_dirty = ext.get("Shared_Dirty").copied().unwrap_or(0);
@@ -289,7 +290,7 @@ impl Collector {
                                 },
                                 size: region.address.1.saturating_sub(region.address.0),
                                 rss: ext.get("Rss").copied().unwrap_or(0),
-                                pss: ext.get("Pss").copied().unwrap_or(0),
+                                pss: Some(ext.get("Pss").copied().unwrap_or(0)),
                                 shared_clean: ext.get("Shared_Clean").copied().unwrap_or(0),
                                 shared_dirty: ext.get("Shared_Dirty").copied().unwrap_or(0),
                                 private_clean: ext.get("Private_Clean").copied().unwrap_or(0),
@@ -405,8 +406,8 @@ mod tests {
         assert_eq!(snapshot.system.swap_in_pages, 1200);
         assert_eq!(snapshot.system.swap_out_pages, 3400);
         assert_eq!(snapshot.system.swap_in_rate, None);
-        assert_eq!(snapshot.system.pressure.some_avg10, Some(1.25));
-        assert_eq!(snapshot.system.pressure.full_avg300, Some(0.02));
+        assert_eq!(snapshot.system.pressure.unwrap().some_avg10, Some(1.25));
+        assert_eq!(snapshot.system.pressure.unwrap().full_avg300, Some(0.02));
         cleanup(&dir);
     }
 
@@ -439,6 +440,6 @@ mod tests {
         let snapshot = collector.collect_snapshot().unwrap();
         assert_eq!(snapshot.system.swap_in_pages, 0);
         assert_eq!(snapshot.system.swap_in_rate, None);
-        assert!(!snapshot.system.pressure.is_available());
+        assert!(!snapshot.system.pressure.unwrap().is_available());
     }
 }

@@ -2,8 +2,9 @@
 
 #![allow(dead_code)]
 
-use std::time::Instant;
-
+#[allow(unused_imports)]
+use crate::ui::globals::RSS_NAME;
+use std::time::Instant; // necessary for tests
 /// Severity level of an insight
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -138,14 +139,16 @@ mod tests {
             "fixture",
             Severity::Warning,
             "High memory",
-            "RSS increased",
+            format!("{RSS_NAME} increased"),
             "Inspect the process",
         )
         .with_process(42, "worker");
         assert_eq!(insight.one_line(), "! worker: High memory");
         assert_eq!(
             insight.detailed(),
-            "[WARN] (worker): High memory\n  RSS increased\n  -> Inspect the process"
+            format!(
+                "[WARN] (worker): High memory\n  {RSS_NAME} increased\n  -> Inspect the process"
+            )
         );
         assert_eq!(Severity::Critical.as_str(), "CRIT");
         assert_eq!(Severity::Critical.icon(), "X");
